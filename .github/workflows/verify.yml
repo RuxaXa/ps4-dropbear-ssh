@@ -1,0 +1,18 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit source tree and artwork
+        run: python3 scripts/audit-public-tree.py
+      - name: Run PS4-port host tests
+        run: ./dropbear/tests/run_ps4_shell_tests.sh

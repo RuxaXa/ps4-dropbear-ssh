@@ -1,0 +1,1781 @@
+diff --git a/Makefile.in b/Makefile.in
+index a26f011..b15fb43 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -44,7 +44,7 @@ _COMMONOBJS=dbutil.o buffer.o dbhelpers.o \
+ 		atomicio.o compat.o fake-rfc2553.o \
+ 		ltc_prng.o ecc.o ecdsa.o sk-ecdsa.o crypto_desc.o \
+ 		curve25519.o ed25519.o sk-ed25519.o \
+-		dbmalloc.o \
++		dbmalloc.o ps4-runtime.o \
+ 		gensignkey.o gendss.o genrsa.o gened25519.o
+ COMMONOBJS = $(patsubst %,$(OBJ_DIR)/%,$(_COMMONOBJS))
+ 
+diff --git a/src/chansession.h b/src/chansession.h
+index cf4fba3..9675b80 100644
+--- a/src/chansession.h
++++ b/src/chansession.h
+@@ -28,6 +28,17 @@
+ #include "loginrec.h"
+ #include "channel.h"
+ #include "listener.h"
++#ifdef __ORBIS__
++#include <pthread.h>
++#include "ps4-shell.h"
++
++enum ps4_command_state {
++	PS4_BACKEND_IDLE,
++	PS4_BACKEND_RUNNING,
++	PS4_BACKEND_EXEC_READY,
++	PS4_BACKEND_DONE
++};
++#endif
+ 
+ struct exitinfo {
+ 
+@@ -54,6 +65,20 @@ struct ChanSess {
+ 	/* exit details */
+ 	struct exitinfo exit;
+ 
++#ifdef __ORBIS__
++	int ps4_backend_state;
++	pthread_t ps4_thread;
++	unsigned char ps4_thread_started;
++	int ps4_backend_fd;
++	int ps4_cancel_fd;
++	unsigned char ps4_pty_requested;
++	unsigned int ps4_term_cols;
++	unsigned int ps4_term_rows;
++	unsigned int ps4_term_width;
++	unsigned int ps4_term_height;
++	struct ps4_shell_state ps4_shell;
++#endif
++
+ 
+ 	/* These are only set temporarily before forking */
+ 	/* Used to set $SSH_CONNECTION in the child session.  */
+diff --git a/src/common-session.c b/src/common-session.c
+index 5031c38..6d76e74 100644
+--- a/src/common-session.c
++++ b/src/common-session.c
+@@ -370,9 +370,27 @@ void session_cleanup() {
+ }
+ 
+ void send_session_identification() {
++#ifdef __ORBIS__
++	const char identification[] = LOCAL_IDENT "\r\n";
++	size_t offset = 0;
++	while (offset < sizeof(identification) - 1) {
++		ssize_t written;
++#ifdef MSG_NOSIGNAL
++		written = send(ses.sock_out, identification + offset,
++				(sizeof(identification) - 1) - offset, MSG_NOSIGNAL);
++#else
++		written = write(ses.sock_out, identification + offset,
++				(sizeof(identification) - 1) - offset);
++#endif
++		if (written < 0 && errno == EINTR) continue;
++		if (written <= 0) dropbear_exit("failed to send identification: %s", strerror(errno));
++		offset += (size_t)written;
++	}
++#else
+ 	buffer *writebuf = buf_new(strlen(LOCAL_IDENT "\r\n") + 1);
+ 	buf_putbytes(writebuf, (const unsigned char *) LOCAL_IDENT "\r\n", strlen(LOCAL_IDENT "\r\n"));
+ 	writebuf_enqueue(writebuf);
++#endif
+ }
+ 
+ static void read_session_identification() {
+@@ -663,6 +681,20 @@ void fill_passwd(const char* username) {
+ 	if (ses.authstate.pw_passwd)
+ 		m_free(ses.authstate.pw_passwd);
+ 
++#ifdef __ORBIS__
++	/* Public PS4 homebrew default account. This intentionally maps the
++	 * documented root login to UID/GID 0 inside the PS4 build only. */
++	if (strcmp(username, "root") == 0) {
++		ses.authstate.pw_uid = 0;
++		ses.authstate.pw_gid = 0;
++		ses.authstate.pw_name = m_strdup("root");
++		ses.authstate.pw_dir = m_strdup("/data/dropbear");
++		ses.authstate.pw_shell = m_strdup("/bin/sh");
++		ses.authstate.pw_passwd = m_strdup("!!");
++		return;
++	}
++#endif
++
+ 	pw = getpwnam(username);
+ 	if (!pw) {
+ 		return;
+diff --git a/src/dbmulti.c b/src/dbmulti.c
+index 919ce3d..e00461e 100644
+--- a/src/dbmulti.c
++++ b/src/dbmulti.c
+@@ -24,6 +24,7 @@
+ 
+ #include "includes.h"
+ #include "dbutil.h"
++#include "ps4-runtime.h"
+ 
+ static int runprog(const char *multipath,
+ 		const char *progname, int argc, char ** argv, int *match) {
+@@ -61,6 +62,26 @@ static int runprog(const char *multipath,
+ }
+ 
+ int main(int argc, char ** argv) {
++	/* Dedicated PS4 eboot builds do not receive a reliable argv[0]. */
++#ifdef __ORBIS__
++	/* Orbis app launches may provide argc == 0 and no readable argv vector. */
++	(void)argc;
++	(void)argv;
++	return ps4_run_server_app("dropbear",
++			"/data/dropbear/dropbear-runtime.log",
++			dropbear_main);
++#else
++	/* PS4 app-launcher mode: when packaged as an eboot.bin there are no
++	 * useful argv values/symlink names. Default to a LAN-only foreground
++	 * Dropbear server on 2222 and let Dropbear create host keys on demand.
++	 * This is for user-owned local research tooling only. */
++	if (argc >= 1 && strcmp(basename(argv[0]), "eboot.bin") == 0) {
++		return ps4_run_server_app(argv[0],
++				"/data/dropbear/dropbear-runtime.log",
++				dropbear_main);
++	}
++#endif
++
+ 	int i;
+ 	for (i = 0; i < 2; i++) {
+ 		const char* multipath = NULL;
+diff --git a/src/dbutil.c b/src/dbutil.c
+index a70025e..fc6f527 100644
+--- a/src/dbutil.c
++++ b/src/dbutil.c
+@@ -62,6 +62,9 @@
+ #endif
+ 
+ #include "includes.h"
++#ifdef __ORBIS__
++#include "ps4-runtime.h"
++#endif
+ #include "dbutil.h"
+ #include "buffer.h"
+ #include "session.h"
+@@ -287,6 +290,12 @@ int spawn_command(void(*exec_fn)(const void *user_data), const void *exec_data,
+ 	}
+ #endif
+ 
++#ifdef __ORBIS__
++	/* PS4 app sandboxes reject process creation. The server session backend
++	 * handles supported commands before reaching this generic spawn path. */
++	return DROPBEAR_FAILURE;
++#endif
++
+ 	/* redirect stdin/stdout/stderr */
+ 	if (pipe(infds) != 0) {
+ 		return DROPBEAR_FAILURE;
+@@ -298,13 +307,18 @@ int spawn_command(void(*exec_fn)(const void *user_data), const void *exec_data,
+ 		return DROPBEAR_FAILURE;
+ 	}
+ 
+-#if DROPBEAR_VFORK
++#ifdef __ORBIS__
++	pid = ps4_fork();
++#elif DROPBEAR_VFORK
+ 	pid = vfork();
+ #else
+ 	pid = fork();
+ #endif
+ 
+ 	if (pid < 0) {
++#ifdef __ORBIS__
++		ps4_runtime_errno_marker("spawn-command-fork-failed", errno);
++#endif
+ 		return DROPBEAR_FAILURE;
+ 	}
+ 
+@@ -313,9 +327,11 @@ int spawn_command(void(*exec_fn)(const void *user_data), const void *exec_data,
+ 
+ 		TRACE(("back to normal sigchld"))
+ 		/* Revert to normal sigchld handling */
++#ifndef __ORBIS__
+ 		if (signal(SIGCHLD, SIG_DFL) == SIG_ERR) {
+ 			dropbear_exit("signal() error");
+ 		}
++#endif
+ 
+ 		/* redirect stdin/stdout */
+ 
+@@ -584,6 +600,14 @@ void setnonblocking(int fd) {
+ 	int fl = 0;
+ 	TRACE(("setnonblocking: %d", fd))
+ 
++#ifdef __ORBIS__
++	/* The regular app sandbox rejects F_GETFL/F_SETFL on accepted sockets and
++	 * pipes. The serial PS4 session still gates I/O with select(), so retaining
++	 * blocking mode is safe for this port. */
++	(void)fd;
++	return;
++#endif
++
+ #if DROPBEAR_FUZZ
+ 	if (fuzz.fuzzing) {
+ 		return;
+diff --git a/src/netio.c b/src/netio.c
+index d5aa0c6..4b1c25d 100644
+--- a/src/netio.c
++++ b/src/netio.c
+@@ -547,6 +547,49 @@ int dropbear_listen(const char* address, const char* port,
+ 		return fuzz_dropbear_listen(address, port, socks, sockcount, errstring, maxfd);
+ 	}
+ #endif
++
++#ifdef __ORBIS__
++	/* libSceLibcInternal's getaddrinfo() may call _exit(1) inside an app
++	 * sandbox. Avoid the resolver entirely for the fixed PS4 daemon endpoint. */
++	if (address && strcmp(address, "0.0.0.0") == 0 &&
++			port && strcmp(port, "2222") == 0) {
++		struct sockaddr_in sa;
++		int saved_errno;
++
++		if (sockcount < 1) {
++			return -1;
++		}
++		memset(&sa, 0, sizeof(sa));
++		sa.sin_family = AF_INET;
++		sa.sin_port = htons(2222);
++		sa.sin_addr.s_addr = htonl(INADDR_ANY);
++
++		sock = socket(AF_INET, SOCK_STREAM, 0);
++		if (sock < 0) {
++			goto ps4_listen_failed;
++		}
++		val = 1;
++		(void)setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
++		if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
++				listen(sock, DROPBEAR_LISTEN_BACKLOG) < 0) {
++			saved_errno = errno;
++			close(sock);
++			errno = saved_errno;
++			goto ps4_listen_failed;
++		}
++		socks[0] = sock;
++		*maxfd = MAX(*maxfd, sock);
++		return 1;
++
++ps4_listen_failed:
++		if (errstring != NULL && *errstring == NULL) {
++			int len = 32 + strlen(strerror(errno));
++			*errstring = (char*)m_malloc(len);
++			snprintf(*errstring, len, "PS4 IPv4 listen failed: %s", strerror(errno));
++		}
++		return -1;
++	}
++#endif
+ 	
+ 	memset(&hints, 0, sizeof(hints));
+ 	hints.ai_family = AF_UNSPEC; /* TODO: let them flag v4 only etc */
+diff --git a/src/sshpty.c b/src/sshpty.c
+index 9f12d67..a2a8f32 100644
+--- a/src/sshpty.c
++++ b/src/sshpty.c
+@@ -22,6 +22,12 @@
+ #include "errno.h"
+ #include "sshpty.h"
+ 
++#ifdef __ORBIS__
++#ifndef TIOCSWINSZ
++#define TIOCSWINSZ LINUX_TIOCSWINSZ
++#endif
++#endif
++
+ /* Pty allocated with _getpty gets broken if we do I_PUSH:es to it. */
+ #if defined(HAVE__GETPTY) || defined(HAVE_OPENPTY)
+ #undef HAVE_DEV_PTMX
+diff --git a/src/svr-auth.c b/src/svr-auth.c
+index 8f519af..3382cb9 100644
+--- a/src/svr-auth.c
++++ b/src/svr-auth.c
+@@ -269,6 +269,18 @@ static int checkusername(const char *username, unsigned int userlen) {
+ 		return DROPBEAR_FAILURE;
+ 	}
+ 
++#ifdef __ORBIS__
++	/* root is a synthetic account and cannot be validated through the
++	 * console's passwd/euid model. Preserve explicit root-login policy. */
++	if (strcmp(ses.authstate.pw_name, "root") == 0) {
++		if (svr_opts.norootlogin) {
++			ses.authstate.checkusername_failed = 1;
++			return DROPBEAR_FAILURE;
++		}
++		return DROPBEAR_SUCCESS;
++	}
++#endif
++
+ 	/* check if we are running as non-root, and login user is different from the server */
+ 	uid = geteuid();
+ 	if (!(DROPBEAR_SVR_MULTIUSER && uid == 0) && uid != ses.authstate.pw_uid) {
+@@ -312,6 +324,13 @@ static int checkusername(const char *username, unsigned int userlen) {
+ 		usershell = "/bin/sh";
+ 	}
+ 
++#ifdef __ORBIS__
++	/* The synthetic PS4 account is not represented in /etc/shells. */
++	if (strcmp(ses.authstate.pw_name, "root") == 0) {
++		goto goodshell;
++	}
++#endif
++
+ 	/* check the shell is valid. If /etc/shells doesn't exist, getusershell()
+ 	 * should return some standard shells like "/bin/sh" and "/bin/csh" (this
+ 	 * is platform-specific) */
+@@ -501,6 +520,14 @@ static int utmp_gid(gid_t *ret_gid) {
+ void svr_switch_user(void) {
+ 	assert(ses.authstate.authdone);
+ 
++#ifdef __ORBIS__
++	/* The app was already elevated by the PS4 runtime and root is a
++	 * synthetic account, so initgroups() cannot resolve it and is unnecessary. */
++	if (strcmp(ses.authstate.pw_name, "root") == 0) {
++		return;
++	}
++#endif
++
+ 	/* We can only change uid/gid as root ... */
+ 	if (getuid() == 0) {
+ 
+diff --git a/src/svr-authpasswd.c b/src/svr-authpasswd.c
+index 899a8ab..b660f1c 100644
+--- a/src/svr-authpasswd.c
++++ b/src/svr-authpasswd.c
+@@ -65,6 +65,21 @@ void svr_auth_password(int valid_user) {
+ 	}
+ 
+ 	password = buf_getstring(ses.payload, &passwordlen);
++#ifdef __ORBIS__
++	if (valid_user
++			&& strcmp(ses.authstate.pw_name, "root") == 0
++			&& passwordlen == sizeof("root") - 1
++			&& constant_time_memcmp(password, "root",
++				sizeof("root") - 1) == 0) {
++		m_burn(password, passwordlen);
++		m_free(password);
++		dropbear_log(LOG_NOTICE,
++				"Password auth succeeded for PS4 default user from %s",
++				svr_ses.addrstring);
++		send_msg_userauth_success();
++		return;
++	}
++#endif
+ 	if (valid_user && passwordlen <= DROPBEAR_MAX_PASSWORD_LEN) {
+ 		/* the first bytes of passwdcrypt are the salt */
+ 		passwdcrypt = ses.authstate.pw_passwd;
+diff --git a/src/svr-authpubkey.c b/src/svr-authpubkey.c
+index 402c15f..10568f5 100644
+--- a/src/svr-authpubkey.c
++++ b/src/svr-authpubkey.c
+@@ -485,12 +485,14 @@ static int checkpubkey(const char* keyalgo, unsigned int keyalgolen,
+ 	int ret = DROPBEAR_FAILURE;
+ 	buffer * line = NULL;
+ 	int line_num;
++#if DROPBEAR_SVR_MULTIUSER && !defined(__ORBIS__)
+ 	uid_t origuid;
+ 	gid_t origgid;
++#endif
+ 
+ 	TRACE(("enter checkpubkey"))
+ 
+-#if DROPBEAR_SVR_MULTIUSER
++#if DROPBEAR_SVR_MULTIUSER && !defined(__ORBIS__)
+ 	/* access the file as the authenticating user. */
+ 	origuid = getuid();
+ 	origgid = getgid();
+@@ -519,7 +521,7 @@ static int checkpubkey(const char* keyalgo, unsigned int keyalgolen,
+ 			TRACE(("checkpubkey: failed opening %s: %s", filename, strerror(errno)))
+ 		}
+ 	}
+-#if DROPBEAR_SVR_MULTIUSER
++#if DROPBEAR_SVR_MULTIUSER && !defined(__ORBIS__)
+ 	if ((seteuid(origuid)) < 0 ||
+ 		(setegid(origgid)) < 0) {
+ 		dropbear_exit("Failed to revert euid");
+diff --git a/src/svr-chansession.c b/src/svr-chansession.c
+index a2ea1fc..2e69efd 100644
+--- a/src/svr-chansession.c
++++ b/src/svr-chansession.c
+@@ -37,6 +37,38 @@
+ #include "agentfwd.h"
+ #include "runopts.h"
+ #include "auth.h"
++#ifdef __ORBIS__
++#include "ps4-runtime.h"
++#include "ps4-scp.h"
++#include <pthread.h>
++
++struct ps4_system_version {
++	unsigned long unknown1;
++	char version[0x1c];
++	unsigned int binary_version;
++	unsigned long unknown2;
++};
++
++void sceKernelGetSystemSwVersion(struct ps4_system_version *version);
++
++struct ps4_shell_context {
++	int fd;
++	struct ChanSess *chansess;
++};
++
++struct ps4_scp_context {
++	int fd;
++	struct ChanSess *chansess;
++	struct ps4_scp_request request;
++};
++
++struct ps4_capture_context {
++	char *output;
++	size_t size;
++	size_t used;
++};
++
++#endif
+ 
+ /* Handles sessions (either shells or programs) requested by the client */
+ 
+@@ -46,7 +78,7 @@ static int sessionpty(struct ChanSess * chansess);
+ static int sessionsignal(const struct ChanSess *chansess);
+ static int noptycommand(struct Channel *channel, struct ChanSess *chansess);
+ static int ptycommand(struct Channel *channel, struct ChanSess *chansess);
+-static int sessionwinchange(const struct ChanSess *chansess);
++static int sessionwinchange(struct ChanSess *chansess);
+ static void execchild(const void *user_data_chansess);
+ static void addchildpid(struct ChanSess *chansess, pid_t pid);
+ static void sesssigchild_handler(int val);
+@@ -55,6 +87,25 @@ static void cleanupchansess(const struct Channel *channel);
+ static int newchansess(struct Channel *channel);
+ static void chansessionrequest(struct Channel *channel);
+ static int sesscheckclose(struct Channel *channel);
++#ifdef __ORBIS__
++static int ps4_builtin_command(struct Channel *channel, struct ChanSess *chansess);
++static int ps4_shell_start(struct Channel *channel, struct ChanSess *chansess);
++static int ps4_scp_start(struct Channel *channel, struct ChanSess *chansess);
++static int ps4_format_command(struct ChanSess *chansess, const char *cmd,
++		char *output, size_t output_size, int *output_len);
++static int ps4_resolve_path(const char *cwd, const char *path,
++		char *resolved, size_t resolved_size);
++static int ps4_list_directory(const char *path, int show_hidden,
++		char *output, size_t output_size, int *output_len);
++static void ps4_write_prompt(int fd, const struct ChanSess *chansess);
++static int ps4_write_all(int fd, const char *data, size_t len);
++static int ps4_write_pipe_all(int fd, const char *data, size_t len);
++static int ps4_write_terminal_output(int fd, const char *data, size_t len);
++static int ps4_terminal_shell_output(void *ctx, const void *data, size_t len);
++static int ps4_capture_shell_output(void *ctx, const void *data, size_t len);
++static void *ps4_shell_thread(void *arg);
++static void *ps4_scp_thread(void *arg);
++#endif
+ 
+ static void send_exitsignalstatus(const struct Channel *channel);
+ static void send_msg_chansess_exitstatus(const struct Channel * channel,
+@@ -76,12 +127,30 @@ const struct ChanType svrchansess = {
+    must not be running (has never started, or has exited) */
+ static int sesscheckclose(struct Channel *channel) {
+ 	struct ChanSess *chansess = (struct ChanSess*)channel->typedata;
+-	TRACE(("sesscheckclose, pid %d, exitpid %d", chansess->pid, chansess->exit.exitpid))
++#ifdef __ORBIS__
++	int backend_state = __atomic_load_n(&chansess->ps4_backend_state, __ATOMIC_ACQUIRE);
++	TRACE(("sesscheckclose, ps4 backend state %d", backend_state))
++	if (backend_state == PS4_BACKEND_RUNNING && channel->recv_close) {
++		int backend_fd = __atomic_exchange_n(&chansess->ps4_backend_fd, -1,
++				__ATOMIC_ACQ_REL);
++		if (backend_fd >= 0) {
++			__atomic_store_n(&chansess->ps4_cancel_fd, backend_fd, __ATOMIC_RELEASE);
++			(void)shutdown(backend_fd, SHUT_RDWR);
++		}
++	}
++	if (backend_state == PS4_BACKEND_DONE) {
++		channel->flushing = 1;
++	}
++	return backend_state == PS4_BACKEND_IDLE || backend_state == PS4_BACKEND_DONE;
++#else
++	int exitpid = chansess->exit.exitpid;
++	TRACE(("sesscheckclose, pid %d, exitpid %d", chansess->pid, exitpid))
+ 
+-	if (chansess->exit.exitpid != -1) {
++	if (exitpid != -1) {
+ 		channel->flushing = 1;
+ 	}
+-	return chansess->pid == 0 || chansess->exit.exitpid != -1;
++	return chansess->pid == 0 || exitpid != -1;
++#endif
+ }
+ 
+ /* Handler for childs exiting, store the state for return to the client */
+@@ -256,6 +325,18 @@ static int newchansess(struct Channel *channel) {
+ 	chansess->term = NULL;
+ 
+ 	chansess->exit.exitpid = -1;
++#ifdef __ORBIS__
++	chansess->ps4_backend_state = PS4_BACKEND_IDLE;
++	chansess->ps4_thread_started = 0;
++	chansess->ps4_backend_fd = -1;
++	chansess->ps4_cancel_fd = -1;
++	chansess->ps4_pty_requested = 0;
++	chansess->ps4_term_cols = 0;
++	chansess->ps4_term_rows = 0;
++	chansess->ps4_term_width = 0;
++	chansess->ps4_term_height = 0;
++	ps4_shell_init(&chansess->ps4_shell, "/data/dropbear");
++#endif
+ 
+ 	channel->typedata = chansess;
+ 
+@@ -319,6 +400,29 @@ static void cleanupchansess(const struct Channel *channel) {
+ 		return;
+ 	}
+ 
++#ifdef __ORBIS__
++	if (chansess->ps4_thread_started) {
++		int backend_fd = __atomic_exchange_n(&chansess->ps4_backend_fd, -1,
++				__ATOMIC_ACQ_REL);
++		int cancel_fd = __atomic_exchange_n(&chansess->ps4_cancel_fd, -1,
++				__ATOMIC_ACQ_REL);
++		if (backend_fd >= 0) {
++			(void)shutdown(backend_fd, SHUT_RDWR);
++		}
++		if (cancel_fd >= 0) {
++			(void)shutdown(cancel_fd, SHUT_RDWR);
++		}
++		(void)pthread_join(chansess->ps4_thread, NULL);
++		if (backend_fd >= 0) {
++			m_close(backend_fd);
++		}
++		if (cancel_fd >= 0) {
++			m_close(cancel_fd);
++		}
++		chansess->ps4_thread_started = 0;
++	}
++#endif
++
+ 	m_free(chansess->cmd);
+ 	m_free(chansess->term);
+ 	m_free(chansess->original_command);
+@@ -418,6 +522,14 @@ out:
+ 			send_msg_channel_failure(channel);
+ 		}
+ 	}
++#ifdef __ORBIS__
++	if (ret == DROPBEAR_SUCCESS) {
++		int expected = PS4_BACKEND_EXEC_READY;
++		(void)__atomic_compare_exchange_n(&chansess->ps4_backend_state,
++				&expected, PS4_BACKEND_DONE, 0,
++				__ATOMIC_RELEASE, __ATOMIC_RELAXED);
++	}
++#endif
+ 
+ 	m_free(type);
+ 	TRACE(("leave chansessionrequest"))
+@@ -428,6 +540,12 @@ out:
+ static int sessionsignal(const struct ChanSess *chansess) {
+ 	TRACE(("sessionsignal"))
+ 
++#ifdef __ORBIS__
++	/* In-process PS4 backends have no child PID. Never route SSH signal
++	 * requests to a synthetic value such as PID 1. */
++	(void)chansess;
++	return DROPBEAR_FAILURE;
++#else
+ 	int sig = 0;
+ 	char* signame = NULL;
+ 	int i;
+@@ -471,12 +589,18 @@ static int sessionsignal(const struct ChanSess *chansess) {
+ 	} 
+ 
+ 	return DROPBEAR_SUCCESS;
++#endif
+ }
+-
+ /* Let the process know that the window size has changed, as notified from the
+  * client. Returns DROPBEAR_SUCCESS or DROPBEAR_FAILURE */
+-static int sessionwinchange(const struct ChanSess *chansess) {
+-
++static int sessionwinchange(struct ChanSess *chansess) {
++#ifdef __ORBIS__
++	chansess->ps4_term_cols = buf_getint(ses.payload);
++	chansess->ps4_term_rows = buf_getint(ses.payload);
++	chansess->ps4_term_width = buf_getint(ses.payload);
++	chansess->ps4_term_height = buf_getint(ses.payload);
++	return DROPBEAR_SUCCESS;
++#else
+ 	int termc, termr, termw, termh;
+ 
+ 	if (chansess->master < 0) {
+@@ -492,6 +616,7 @@ static int sessionwinchange(const struct ChanSess *chansess) {
+ 	pty_change_window_size(chansess->master, termr, termc, termw, termh);
+ 
+ 	return DROPBEAR_SUCCESS;
++#endif
+ }
+ 
+ static void get_termmodes(const struct ChanSess *chansess) {
+@@ -499,52 +624,37 @@ static void get_termmodes(const struct ChanSess *chansess) {
+ 	struct termios termio;
+ 	unsigned char opcode;
+ 	unsigned int value;
+-	const struct TermCode * termcode;
++	const struct TermCode *termcode;
+ 	unsigned int len;
+ 
+ 	TRACE(("enter get_termmodes"))
+-
+-	/* Term modes */
+-	/* We'll ignore errors and continue if we can't set modes.
+-	 * We're ignoring baud rates since they seem evil */
+ 	if (tcgetattr(chansess->master, &termio) == -1) {
+ 		return;
+ 	}
+ 
+ 	len = buf_getint(ses.payload);
+-	TRACE(("term mode str %d p->l %d p->p %d", 
+-				len, ses.payload->len , ses.payload->pos));
++	TRACE(("term mode str %d p->l %d p->p %d",
++				len, ses.payload->len, ses.payload->pos));
+ 	if (len != ses.payload->len - ses.payload->pos) {
+ 		dropbear_exit("Bad term mode string");
+ 	}
+-
+ 	if (len == 0) {
+ 		TRACE(("leave get_termmodes: empty terminal modes string"))
+ 		return;
+ 	}
+ 
+ 	while (((opcode = buf_getbyte(ses.payload)) != 0x00) && opcode <= 159) {
+-
+-		/* must be before checking type, so that value is consumed even if
+-		 * we don't use it */
+ 		value = buf_getint(ses.payload);
+-
+-		/* handle types of code */
+ 		if (opcode > MAX_TERMCODE) {
+ 			continue;
+ 		}
+ 		termcode = &termcodes[(unsigned int)opcode];
+-		
+-
+ 		switch (termcode->type) {
+-
+ 			case TERMCODE_NONE:
+ 				break;
+-
+ 			case TERMCODE_CONTROLCHAR:
+ 				termio.c_cc[termcode->mapcode] = value;
+ 				break;
+-
+ 			case TERMCODE_INPUT:
+ 				if (value) {
+ 					termio.c_iflag |= termcode->mapcode;
+@@ -552,7 +662,6 @@ static void get_termmodes(const struct ChanSess *chansess) {
+ 					termio.c_iflag &= ~(termcode->mapcode);
+ 				}
+ 				break;
+-
+ 			case TERMCODE_OUTPUT:
+ 				if (value) {
+ 					termio.c_oflag |= termcode->mapcode;
+@@ -560,7 +669,6 @@ static void get_termmodes(const struct ChanSess *chansess) {
+ 					termio.c_oflag &= ~(termcode->mapcode);
+ 				}
+ 				break;
+-
+ 			case TERMCODE_LOCAL:
+ 				if (value) {
+ 					termio.c_lflag |= termcode->mapcode;
+@@ -568,7 +676,6 @@ static void get_termmodes(const struct ChanSess *chansess) {
+ 					termio.c_lflag &= ~(termcode->mapcode);
+ 				}
+ 				break;
+-
+ 			case TERMCODE_CONTROL:
+ 				if (value) {
+ 					termio.c_cflag |= termcode->mapcode;
+@@ -576,7 +683,6 @@ static void get_termmodes(const struct ChanSess *chansess) {
+ 					termio.c_cflag &= ~(termcode->mapcode);
+ 				}
+ 				break;
+-				
+ 		}
+ 	}
+ 	if (tcsetattr(chansess->master, TCSANOW, &termio) < 0) {
+@@ -588,27 +694,43 @@ static void get_termmodes(const struct ChanSess *chansess) {
+ /* Set up a session pty which will be used to execute the shell or program.
+  * The pty is allocated now, and kept for when the shell/program executes.
+  * Returns DROPBEAR_SUCCESS or DROPBEAR_FAILURE */
+-static int sessionpty(struct ChanSess * chansess) {
+-
++static int sessionpty(struct ChanSess *chansess) {
+ 	unsigned int termlen;
++#ifndef __ORBIS__
+ 	char namebuf[65];
+-	struct passwd * pw = NULL;
++	struct passwd *pw = NULL;
++#endif
+ 
+ 	TRACE(("enter sessionpty"))
+-
+ 	if (!svr_pubkey_allows_pty()) {
+ 		TRACE(("leave sessionpty : pty forbidden by public key option"))
+ 		return DROPBEAR_FAILURE;
+ 	}
++	if (chansess->term != NULL) {
++		TRACE(("leave sessionpty: multiple pty requests"))
++		return DROPBEAR_FAILURE;
++	}
+ 
+ 	chansess->term = buf_getstring(ses.payload, &termlen);
+ 	if (termlen > MAX_TERM_LEN) {
+-		/* TODO send disconnect ? */
+ 		TRACE(("leave sessionpty: term len too long"))
++		m_free(chansess->term);
++		chansess->term = NULL;
+ 		return DROPBEAR_FAILURE;
+ 	}
+ 
+-	/* allocate the pty */
++#ifdef __ORBIS__
++	chansess->ps4_term_cols = buf_getint(ses.payload);
++	chansess->ps4_term_rows = buf_getint(ses.payload);
++	chansess->ps4_term_width = buf_getint(ses.payload);
++	chansess->ps4_term_height = buf_getint(ses.payload);
++	{
++		char *modes = buf_getstring(ses.payload, NULL);
++		m_free(modes);
++	}
++	chansess->ps4_pty_requested = 1;
++	return DROPBEAR_SUCCESS;
++#else
+ 	if (chansess->master != -1) {
+ 		dropbear_exit("Multiple pty requests");
+ 	}
+@@ -616,25 +738,20 @@ static int sessionpty(struct ChanSess * chansess) {
+ 		TRACE(("leave sessionpty: failed to allocate pty"))
+ 		return DROPBEAR_FAILURE;
+ 	}
+-	
+ 	chansess->tty = m_strdup(namebuf);
+ 	if (!chansess->tty) {
+-		dropbear_exit("Out of memory"); /* TODO disconnect */
++		dropbear_exit("Out of memory");
+ 	}
+-
+ 	pw = getpwnam(ses.authstate.pw_name);
+-	if (!pw)
++	if (!pw) {
+ 		dropbear_exit("getpwnam failed after succeeding previously");
++	}
+ 	pty_setowner(pw, chansess->tty);
+-
+-	/* Set up the rows/col counts */
+ 	sessionwinchange(chansess);
+-
+-	/* Read the terminal modes */
+ 	get_termmodes(chansess);
+-
+ 	TRACE(("leave sessionpty"))
+ 	return DROPBEAR_SUCCESS;
++#endif
+ }
+ 
+ #if !DROPBEAR_VFORK
+@@ -673,7 +790,11 @@ static int sessioncommand(struct Channel *channel, struct ChanSess *chansess,
+ 
+ 	TRACE(("enter sessioncommand %d", channel->index))
+ 
++#ifdef __ORBIS__
++	if (__atomic_load_n(&chansess->ps4_backend_state, __ATOMIC_ACQUIRE) != PS4_BACKEND_IDLE) {
++#else
+ 	if (chansess->pid != 0) {
++#endif
+ 		/* Note that only one command can _succeed_. The client might try
+ 		 * one command (which fails), then try another. Ie fallback
+ 		 * from sftp to scp */
+@@ -688,6 +809,7 @@ static int sessioncommand(struct Channel *channel, struct ChanSess *chansess,
+ 
+ 			if (cmdlen > MAX_CMD_LEN) {
+ 				m_free(chansess->cmd);
++				chansess->cmd = NULL;
+ 				/* TODO - send error - too long ? */
+ 				TRACE(("leave sessioncommand, command too long %d", cmdlen))
+ 				return DROPBEAR_FAILURE;
+@@ -704,6 +826,7 @@ static int sessioncommand(struct Channel *channel, struct ChanSess *chansess,
+ #endif
+ 			{
+ 				m_free(chansess->cmd);
++				chansess->cmd = NULL;
+ 				TRACE(("leave sessioncommand, unknown subsystem"))
+ 				return DROPBEAR_FAILURE;
+ 			}
+@@ -735,6 +858,25 @@ static int sessioncommand(struct Channel *channel, struct ChanSess *chansess,
+ 	}
+ #endif
+ 
++#ifdef __ORBIS__
++	/* Orbis app sandboxes reject fork() with EPERM. Run remote commands and
++	 * the interactive shell in-process while retaining normal channel IO. */
++	if (!issubsys) {
++		if (iscmd && strncmp(chansess->cmd, "scp", 3) == 0 &&
++				(chansess->cmd[3] == '\0' || chansess->cmd[3] == ' ')) {
++			ret = ps4_scp_start(channel, chansess);
++		} else {
++			ret = iscmd ? ps4_builtin_command(channel, chansess)
++					: ps4_shell_start(channel, chansess);
++		}
++		if (ret == DROPBEAR_FAILURE) {
++			m_free(chansess->cmd);
++			chansess->cmd = NULL;
++		}
++		return ret;
++	}
++#endif
++
+ 	/* uClinux will vfork(), so there'll be a race as 
+ 	connection_string is freed below. */
+ #if !DROPBEAR_VFORK
+@@ -760,11 +902,501 @@ static int sessioncommand(struct Channel *channel, struct ChanSess *chansess,
+ 
+ 	if (ret == DROPBEAR_FAILURE) {
+ 		m_free(chansess->cmd);
++		chansess->cmd = NULL;
+ 	}
+ 	TRACE(("leave sessioncommand, ret %d", ret))
+ 	return ret;
+ }
+ 
++#ifdef __ORBIS__
++static int ps4_resolve_path(const char *cwd, const char *path,
++		char *resolved, size_t resolved_size) {
++	char combined[PS4_SHELL_PATH_MAX * 2];
++	size_t combined_len;
++	size_t input_pos = 0;
++	size_t output_len = 1;
++
++	if (path == NULL || *path == '\0') {
++		path = cwd;
++	}
++	if (*path == '/') {
++		combined_len = (size_t)snprintf(combined, sizeof(combined), "%s", path);
++	} else {
++		combined_len = (size_t)snprintf(combined, sizeof(combined), "%s/%s", cwd, path);
++	}
++	if (combined_len >= sizeof(combined) || resolved_size < 2) {
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++
++	resolved[0] = '/';
++	resolved[1] = '\0';
++	while (combined[input_pos] != '\0') {
++		size_t start;
++		size_t length;
++
++		while (combined[input_pos] == '/') {
++			input_pos++;
++		}
++		if (combined[input_pos] == '\0') {
++			break;
++		}
++		start = input_pos;
++		while (combined[input_pos] != '\0' && combined[input_pos] != '/') {
++			input_pos++;
++		}
++		length = input_pos - start;
++		if (length == 1 && combined[start] == '.') {
++			continue;
++		}
++		if (length == 2 && combined[start] == '.' && combined[start + 1] == '.') {
++			while (output_len > 1 && resolved[output_len - 1] != '/') {
++				output_len--;
++			}
++			if (output_len > 1) {
++				output_len--;
++			}
++			resolved[output_len] = '\0';
++			continue;
++		}
++		if (output_len > 1) {
++			if (output_len + 1 >= resolved_size) {
++				errno = ENAMETOOLONG;
++				return -1;
++			}
++			resolved[output_len++] = '/';
++		}
++		if (output_len + length >= resolved_size) {
++			errno = ENAMETOOLONG;
++			return -1;
++		}
++		memcpy(resolved + output_len, combined + start, length);
++		output_len += length;
++		resolved[output_len] = '\0';
++	}
++	return 0;
++}
++
++static int ps4_list_directory(const char *path, int show_hidden,
++		char *output, size_t output_size, int *output_len) {
++	struct dirent *entry;
++	DIR *directory;
++	size_t used = 0;
++
++	directory = opendir(path);
++	if (directory == NULL) {
++		int len = snprintf(output, output_size, "ls: %s: %s\n", path, strerror(errno));
++		if (len < 0) {
++			return -1;
++		}
++		*output_len = MIN(len, (int)output_size - 1);
++		return 1;
++	}
++	while ((entry = readdir(directory)) != NULL) {
++		size_t name_len = strlen(entry->d_name);
++		int is_directory = entry->d_type == DT_DIR;
++		if (!show_hidden && entry->d_name[0] == '.') {
++			continue;
++		}
++		if (used + name_len + (is_directory ? 2 : 1) >= output_size) {
++			if (used + 4 < output_size) {
++				memcpy(output + used, "...\n", 4);
++				used += 4;
++			}
++			break;
++		}
++		memcpy(output + used, entry->d_name, name_len);
++		used += name_len;
++		if (is_directory) {
++			output[used++] = '/';
++		}
++		output[used++] = '\n';
++	}
++	closedir(directory);
++	output[used] = '\0';
++	*output_len = (int)used;
++	return 0;
++}
++
++static int ps4_capture_shell_output(void *ctx, const void *data, size_t len) {
++	struct ps4_capture_context *capture = ctx;
++	size_t available = capture->size > capture->used ? capture->size - capture->used : 0;
++
++	if (len >= available) {
++		if (available > 1) {
++			memcpy(capture->output + capture->used, data, available - 1);
++			capture->used += available - 1;
++		}
++		if (capture->size > 0) {
++			capture->output[capture->used] = '\0';
++		}
++		errno = ENOSPC;
++		return -1;
++	}
++	memcpy(capture->output + capture->used, data, len);
++	capture->used += len;
++	capture->output[capture->used] = '\0';
++	return 0;
++}
++
++static int ps4_format_command(struct ChanSess *chansess, const char *cmd,
++		char *output, size_t output_size, int *output_len) {
++	struct ps4_system_version version;
++	struct ps4_capture_context capture;
++	const char *echo_text;
++	int status = 0;
++	int len;
++
++	while (*cmd == ' ' || *cmd == '	') {
++		cmd++;
++	}
++	if (strcmp(cmd, "id") == 0) {
++		len = snprintf(output, output_size, "uid=0(root) gid=0(root) groups=0(root)\n");
++	} else if (strcmp(cmd, "whoami") == 0) {
++		len = snprintf(output, output_size, "root\n");
++	} else if (strcmp(cmd, "uname") == 0 || strcmp(cmd, "uname -a") == 0) {
++		memset(&version, 0, sizeof(version));
++		sceKernelGetSystemSwVersion(&version);
++		if (strcmp(cmd, "uname -a") == 0) {
++			len = snprintf(output, output_size, "OrbisOS %s x86_64\n", version.version);
++		} else {
++			len = snprintf(output, output_size, "OrbisOS\n");
++		}
++	} else if (strncmp(cmd, "echo", 4) == 0 && (cmd[4] == '\0' || cmd[4] == ' ')) {
++		echo_text = cmd + 4;
++		while (*echo_text == ' ') {
++			echo_text++;
++		}
++		len = snprintf(output, output_size, "%s\n", echo_text);
++	} else if (strcmp(cmd, "true") == 0) {
++		len = 0;
++	} else if (strcmp(cmd, "false") == 0) {
++		len = 0;
++		status = 1;
++	} else if (strcmp(cmd, "help") == 0) {
++		len = snprintf(output, output_size,
++				"Built-ins: pwd cd ls [-la] cat head tail stat hexdump grep find touch "
++				"mkdir rmdir rm cp mv chmod id whoami uname echo true false help exit\n");
++	} else if (*cmd == '\0') {
++		len = 0;
++	} else {
++		capture.output = output;
++		capture.size = output_size;
++		capture.used = 0;
++		status = ps4_shell_execute(&chansess->ps4_shell, cmd,
++				ps4_capture_shell_output, &capture);
++		*output_len = (int)capture.used;
++		return status;
++	}
++
++formatted:
++	if (len < 0) {
++		return -1;
++	}
++	if ((size_t)len >= output_size) {
++		len = (int)output_size - 1;
++	}
++	*output_len = len;
++	return status;
++}
++
++static int ps4_write_all(int fd, const char *data, size_t len) {
++	while (len > 0) {
++		ssize_t written;
++#ifdef MSG_NOSIGNAL
++		written = send(fd, data, len, MSG_NOSIGNAL);
++		if (written < 0 && errno == ENOTSOCK) {
++			written = write(fd, data, len);
++		}
++#else
++		written = write(fd, data, len);
++#endif
++		if (written < 0 && errno == EINTR) {
++			continue;
++		}
++		if (written <= 0) {
++			return -1;
++		}
++		data += written;
++		len -= (size_t)written;
++	}
++	return 0;
++}
++
++static int ps4_write_pipe_all(int fd, const char *data, size_t len) {
++	while (len > 0) {
++		ssize_t written = write(fd, data, len);
++		if (written < 0 && errno == EINTR) {
++			continue;
++		}
++		if (written <= 0) {
++			return -1;
++		}
++		data += written;
++		len -= (size_t)written;
++	}
++	return 0;
++}
++
++static int ps4_write_terminal_output(int fd, const char *data, size_t len) {
++	size_t start = 0;
++	size_t index;
++
++	for (index = 0; index < len; index++) {
++		if (data[index] != '\n' || (index > 0 && data[index - 1] == '\r')) {
++			continue;
++		}
++		if (index > start && ps4_write_all(fd, data + start, index - start) != 0) {
++			return -1;
++		}
++		if (ps4_write_all(fd, "\r\n", 2) != 0) {
++			return -1;
++		}
++		start = index + 1;
++	}
++	if (start < len && ps4_write_all(fd, data + start, len - start) != 0) {
++		return -1;
++	}
++	return 0;
++}
++
++static int ps4_terminal_shell_output(void *ctx, const void *data, size_t len) {
++	int fd = *(int *)ctx;
++	return ps4_write_terminal_output(fd, data, len);
++}
++
++static void ps4_write_prompt(int fd, const struct ChanSess *chansess) {
++	char prompt[PS4_SHELL_PATH_MAX + 8];
++	int len = snprintf(prompt, sizeof(prompt), "ps4:%s# ", chansess->ps4_shell.cwd);
++	if (len > 0) {
++		(void)ps4_write_all(fd, prompt, MIN((size_t)len, sizeof(prompt) - 1));
++	}
++}
++
++static int ps4_builtin_command(struct Channel *channel, struct ChanSess *chansess) {
++	char output[4096];
++	int outfds[2];
++	int status;
++	int len;
++
++	status = ps4_format_command(chansess, chansess->cmd, output, sizeof(output), &len);
++	if (status < 0 || pipe(outfds) != 0) {
++		return DROPBEAR_FAILURE;
++	}
++	if (len > 0 && ps4_write_pipe_all(outfds[1], output, (size_t)len) != 0) {
++		m_close(outfds[0]);
++		m_close(outfds[1]);
++		return DROPBEAR_FAILURE;
++	}
++	m_close(outfds[1]);
++
++	channel->writefd = open("/dev/null", O_WRONLY);
++	if (channel->writefd < 0) {
++		m_close(outfds[0]);
++		return DROPBEAR_FAILURE;
++	}
++	channel->readfd = outfds[0];
++	channel->errfd = -1;
++	channel->bidir_fd = 0;
++	channel->prio = DROPBEAR_PRIO_NORMAL;
++	ses.maxfd = MAX(ses.maxfd, channel->writefd);
++	ses.maxfd = MAX(ses.maxfd, channel->readfd);
++
++	chansess->exit.exitpid = 0;
++	chansess->exit.exitstatus = status;
++	chansess->exit.exitsignal = -1;
++	chansess->exit.exitcore = 0;
++	__atomic_store_n(&chansess->ps4_backend_state, PS4_BACKEND_EXEC_READY,
++			__ATOMIC_RELEASE);
++	return DROPBEAR_SUCCESS;
++}
++
++static void *ps4_shell_thread(void *arg) {
++	struct ps4_shell_context *context = arg;
++	struct ChanSess *chansess = context->chansess;
++	char command[512];
++	char output[4096];
++	char byte;
++	size_t command_len = 0;
++	int status = 0;
++	int output_len;
++	int last_was_cr = 0;
++	int fd = context->fd;
++
++	free(context);
++	(void)ps4_write_all(fd, "Dropbear SSH for PS4 by RuxaXa\r\nType 'help' for commands.\r\n",
++			sizeof("Dropbear SSH for PS4 by RuxaXa\r\nType 'help' for commands.\r\n") - 1);
++	ps4_write_prompt(fd, chansess);
++	while (read(fd, &byte, 1) == 1) {
++		if (byte == '\r' || byte == '\n') {
++			if (byte == '\n' && last_was_cr) {
++				last_was_cr = 0;
++				continue;
++			}
++			last_was_cr = (byte == '\r');
++			(void)ps4_write_all(fd, "\r\n", 2);
++			command[command_len] = '\0';
++			if (strcmp(command, "exit") == 0 || strcmp(command, "logout") == 0) {
++				(void)ps4_write_all(fd, "logout\r\n", 8);
++				break;
++			}
++			if (ps4_shell_handles(command)) {
++				status = ps4_shell_execute(&chansess->ps4_shell, command,
++						ps4_terminal_shell_output, &fd);
++				output_len = 0;
++			} else {
++				status = ps4_format_command(chansess, command, output, sizeof(output), &output_len);
++			}
++			if (status < 0) {
++				status = 1;
++				output_len = 0;
++			}
++			if (output_len > 0) {
++				(void)ps4_write_terminal_output(fd, output, (size_t)output_len);
++			}
++			command_len = 0;
++			ps4_write_prompt(fd, chansess);
++		} else if (byte == 0x7f || byte == '\b') {
++			last_was_cr = 0;
++			if (command_len > 0) {
++				command_len--;
++				(void)ps4_write_all(fd, "\b \b", 3);
++			}
++		} else if (byte == 0x04 && command_len == 0) {
++			(void)ps4_write_all(fd, "logout\r\n", 8);
++			break;
++		} else if (byte == 0x03) {
++			last_was_cr = 0;
++			command_len = 0;
++			status = 130;
++			(void)ps4_write_all(fd, "^C\r\n", sizeof("^C\r\n") - 1);
++			ps4_write_prompt(fd, chansess);
++		} else if ((unsigned char)byte >= 0x20 && command_len < sizeof(command) - 1) {
++			last_was_cr = 0;
++			command[command_len++] = byte;
++			(void)ps4_write_all(fd, &byte, 1);
++		}
++	}
++
++	chansess->exit.exitpid = 0;
++	chansess->exit.exitstatus = status;
++	chansess->exit.exitsignal = -1;
++	chansess->exit.exitcore = 0;
++	__atomic_store_n(&chansess->ps4_backend_state, PS4_BACKEND_DONE,
++			__ATOMIC_RELEASE);
++	if (__atomic_exchange_n(&chansess->ps4_backend_fd, -1,
++			__ATOMIC_ACQ_REL) >= 0) {
++		close(fd);
++	}
++	return NULL;
++}
++
++static int ps4_shell_start(struct Channel *channel, struct ChanSess *chansess) {
++	struct ps4_shell_context *context;
++	int sockets[2];
++
++	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
++		return DROPBEAR_FAILURE;
++	}
++	context = malloc(sizeof(*context));
++	if (context == NULL) {
++		m_close(sockets[0]);
++		m_close(sockets[1]);
++		return DROPBEAR_FAILURE;
++	}
++	context->fd = sockets[1];
++	context->chansess = chansess;
++	__atomic_store_n(&chansess->ps4_backend_fd, sockets[1], __ATOMIC_RELEASE);
++	__atomic_store_n(&chansess->ps4_backend_state, PS4_BACKEND_RUNNING,
++			__ATOMIC_RELEASE);
++	chansess->ps4_thread_started = 1;
++	if (pthread_create(&chansess->ps4_thread, NULL, ps4_shell_thread, context) != 0) {
++		chansess->ps4_thread_started = 0;
++		__atomic_store_n(&chansess->ps4_backend_state, PS4_BACKEND_IDLE,
++				__ATOMIC_RELEASE);
++		__atomic_store_n(&chansess->ps4_backend_fd, -1, __ATOMIC_RELEASE);
++		free(context);
++		m_close(sockets[0]);
++		m_close(sockets[1]);
++		return DROPBEAR_FAILURE;
++	}
++	channel->writefd = sockets[0];
++	channel->readfd = sockets[0];
++	channel->errfd = -1;
++	channel->bidir_fd = 1;
++	channel->prio = DROPBEAR_PRIO_LOWDELAY;
++	ses.maxfd = MAX(ses.maxfd, sockets[0]);
++	return DROPBEAR_SUCCESS;
++}
++
++static void *ps4_scp_thread(void *arg) {
++	struct ps4_scp_context *context = arg;
++	struct ChanSess *chansess = context->chansess;
++	struct ps4_scp_request request = context->request;
++	int fd = context->fd;
++	int status;
++
++	free(context);
++	status = ps4_scp_serve(fd, &request);
++	ps4_runtime_errno_marker(status == 0 ? "scp-worker-done" : "scp-worker-failed", errno);
++	chansess->exit.exitpid = 0;
++	chansess->exit.exitstatus = status == 0 ? 0 : 1;
++	chansess->exit.exitsignal = -1;
++	chansess->exit.exitcore = 0;
++	__atomic_store_n(&chansess->ps4_backend_state, PS4_BACKEND_DONE,
++			__ATOMIC_RELEASE);
++	if (__atomic_exchange_n(&chansess->ps4_backend_fd, -1,
++			__ATOMIC_ACQ_REL) >= 0) {
++		close(fd);
++	}
++	return NULL;
++}
++
++static int ps4_scp_start(struct Channel *channel, struct ChanSess *chansess) {
++	struct ps4_scp_context *context;
++	struct ps4_scp_request request;
++	int sockets[2];
++
++	if (ps4_scp_parse_command(chansess->cmd, chansess->ps4_shell.cwd, &request) != 0) {
++		return DROPBEAR_FAILURE;
++	}
++	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
++		return DROPBEAR_FAILURE;
++	}
++	context = malloc(sizeof(*context));
++	if (context == NULL) {
++		m_close(sockets[0]);
++		m_close(sockets[1]);
++		return DROPBEAR_FAILURE;
++	}
++	context->fd = sockets[1];
++	context->chansess = chansess;
++	context->request = request;
++	__atomic_store_n(&chansess->ps4_backend_fd, sockets[1], __ATOMIC_RELEASE);
++	__atomic_store_n(&chansess->ps4_backend_state, PS4_BACKEND_RUNNING,
++			__ATOMIC_RELEASE);
++	chansess->ps4_thread_started = 1;
++	if (pthread_create(&chansess->ps4_thread, NULL, ps4_scp_thread, context) != 0) {
++		chansess->ps4_thread_started = 0;
++		__atomic_store_n(&chansess->ps4_backend_state, PS4_BACKEND_IDLE,
++				__ATOMIC_RELEASE);
++		__atomic_store_n(&chansess->ps4_backend_fd, -1, __ATOMIC_RELEASE);
++		free(context);
++		m_close(sockets[0]);
++		m_close(sockets[1]);
++		return DROPBEAR_FAILURE;
++	}
++	channel->writefd = sockets[0];
++	channel->readfd = sockets[0];
++	channel->errfd = -1;
++	channel->bidir_fd = 1;
++	channel->prio = DROPBEAR_PRIO_NORMAL;
++	ses.maxfd = MAX(ses.maxfd, sockets[0]);
++	return DROPBEAR_SUCCESS;
++}
++
++#endif
++
+ /* Execute a command and set up redirection of stdin/stdout/stderr without a
+  * pty.
+  * Returns DROPBEAR_SUCCESS or DROPBEAR_FAILURE */
+@@ -829,22 +1461,30 @@ static int ptycommand(struct Channel *channel, struct ChanSess *chansess) {
+ 		return DROPBEAR_FAILURE;
+ 	}
+ 	
+-#if DROPBEAR_VFORK
++#ifdef __ORBIS__
++	pid = ps4_fork();
++#elif DROPBEAR_VFORK
+ 	pid = vfork();
+ #else
+ 	pid = fork();
+ #endif
+-	if (pid < 0)
++	if (pid < 0) {
++#ifdef __ORBIS__
++		ps4_runtime_errno_marker("pty-command-fork-failed", errno);
++#endif
+ 		return DROPBEAR_FAILURE;
++	}
+ 
+ 	if (pid == 0) {
+ 		/* child */
+ 		
+ 		TRACE(("back to normal sigchld"))
+ 		/* Revert to normal sigchld handling */
++#ifndef __ORBIS__
+ 		if (signal(SIGCHLD, SIG_DFL) == SIG_ERR) {
+ 			dropbear_exit("signal() error");
+ 		}
++#endif
+ 		
+ 		/* redirect stdin/stdout/stderr */
+ 		close(chansess->master);
+@@ -1080,12 +1720,18 @@ void svr_chansessinitialise() {
+ 	svr_ses.childpids[0].chansess = NULL;
+ 	svr_ses.childpidsize = 1;
+ 	svr_ses.lastexit.exitpid = -1; /* Nothing has exited yet */
++#ifndef __ORBIS__
+ 	sa_chld.sa_handler = sesssigchild_handler;
+ 	sa_chld.sa_flags = SA_NOCLDSTOP;
+ 	sigemptyset(&sa_chld.sa_mask);
+ 	if (sigaction(SIGCHLD, &sa_chld, NULL) < 0) {
+ 		dropbear_exit("signal() error");
+ 	}
++#else
++	/* PS4 app sandboxes deny SIGCHLD registration and cannot fork session
++	 * children, so no child-exit handler is required in serial mode. */
++	(void)sa_chld;
++#endif
+ 	
+ }
+ 
+diff --git a/src/svr-main.c b/src/svr-main.c
+index 6373e59..bb8e38d 100644
+--- a/src/svr-main.c
++++ b/src/svr-main.c
+@@ -31,6 +31,13 @@
+ #include "dbrandom.h"
+ #include "crypto_desc.h"
+ 
++#ifdef __ORBIS__
++#include <setjmp.h>
++#include <orbis/libkernel.h>
++jmp_buf ps4_session_jmp;
++volatile int ps4_session_active = 0;
++#endif
++
+ static size_t listensockets(int *sock, size_t sockcount, int *maxfd);
+ static void sigchld_handler(int dummy);
+ static void sigsegv_handler(int);
+@@ -38,6 +45,11 @@ static void sigintterm_handler(int fish);
+ static void main_inetd(void);
+ static void main_noinetd(int argc, char ** argv, const char* multipath);
+ static void commonsetup(void);
++#ifdef __ORBIS__
++static void ps4_server_stage(const char *stage);
++static void ps4_server_stage_errno(const char *stage, int err);
++static void ps4_server_notify_started(const char *port);
++#endif
+ 
+ #if defined(DBMULTI_dropbear) || !DROPBEAR_MULTI
+ #if defined(DBMULTI_dropbear) && DROPBEAR_MULTI
+@@ -155,11 +167,20 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
+ 	memset(preauth_addrs, 0x0, sizeof(preauth_addrs));
+ 
+ 	/* Set up the listening sockets */
++#ifdef __ORBIS__
++	ps4_server_stage("listener-setup-start");
++#endif
+ 	listensockcount = listensockets(listensocks, MAX_LISTEN_ADDR, &maxsock);
++#ifdef __ORBIS__
++	ps4_server_stage(listensockcount == 0 ? "listener-setup-failed" : "listener-setup-done");
++#endif
+ 	if (listensockcount == 0)
+ 	{
+ 		dropbear_exit("No listening ports available.");
+ 	}
++#ifdef __ORBIS__
++	ps4_server_notify_started(svr_opts.portcount > 0 ? svr_opts.ports[0] : "2222");
++#endif
+ 
+ 	for (i = 0; i < listensockcount; i++) {
+ 		FD_SET(listensocks[i], &fds);
+@@ -272,9 +293,15 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
+ 				/* accept failed */
+ 				continue;
+ 			}
++#ifdef __ORBIS__
++			ps4_server_stage("accept-done");
++#endif
+ 
+ 			/* Limit the number of unauthenticated connections per IP */
+ 			getaddrstring(&remoteaddr, &remote_host, NULL, 0);
++#ifdef __ORBIS__
++			ps4_server_stage("remote-address-done");
++#endif
+ 
+ 			num_unauthed_for_addr = 0;
+ 			num_unauthed_total = 0;
+@@ -298,9 +325,15 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
+ 			seedrandom();
+ 
+ 			if (pipe(childpipe) < 0) {
++#ifdef __ORBIS__
++				ps4_server_stage_errno("pipe-failed", errno);
++#endif
+ 				TRACE(("error creating child pipe"))
+ 				goto out;
+ 			}
++#ifdef __ORBIS__
++			ps4_server_stage("pipe-done");
++#endif
+ 
+ #if DEBUG_NOFORK
+ 			fork_ret = 0;
+@@ -308,9 +341,15 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
+ 			fork_ret = fork();
+ #endif
+ 			if (fork_ret < 0) {
++#ifdef __ORBIS__
++				ps4_server_stage_errno("fork-failed", errno);
++#endif
+ 				dropbear_log(LOG_WARNING, "Error forking: %s", strerror(errno));
+ 				goto out;
+ 			}
++#ifdef __ORBIS__
++			ps4_server_stage(fork_ret > 0 ? "fork-parent" : "fork-child");
++#endif
+ 
+ 			addrandom((void*)&fork_ret, sizeof(fork_ret));
+ 
+@@ -328,8 +367,29 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
+ 				getaddrstring(&remoteaddr, NULL, &remote_port, 0);
+ 				dropbear_log(LOG_INFO, "Child connection from %s:%s", remote_host, remote_port);
+ 				m_free(remote_host);
++				remote_host = NULL;
+ 				m_free(remote_port);
+ 
++#ifdef __ORBIS__
++				/* PS4 app sandboxes deny fork(). Handle one session at a time in
++				 * this process, then longjmp back here after session_cleanup(). */
++				m_close(childpipe[0]);
++				m_close(childpipe[1]);
++				/* A normal fork supplies each connection with the same fresh parent copy
++				 * of per-session globals. Recreate that state while retaining svr_opts. */
++				memset(&ses, 0, sizeof(ses));
++				memset(&svr_ses, 0, sizeof(svr_ses));
++				ps4_session_active = 1;
++				ps4_server_stage("serial-session-start");
++				if (setjmp(ps4_session_jmp) == 0) {
++					svr_session(childsock, -1);
++					dropbear_assert(0);
++				}
++				ps4_session_active = 0;
++				childsock = -1; /* closed by session_cleanup() */
++				ps4_server_stage("serial-session-done");
++				continue;
++#else
+ #if !DEBUG_NOFORK
+ 				if (setsid() < 0) {
+ 					dropbear_exit("setsid: %s", strerror(errno));
+@@ -385,6 +445,7 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
+ 				svr_session(childsock, childpipe[1]);
+ 				/* don't return */
+ 				dropbear_assert(0);
++#endif /* __ORBIS__ */
+ 			}
+ 
+ out:
+@@ -436,6 +497,37 @@ static void sigintterm_handler(int UNUSED(unused)) {
+ }
+ 
+ /* Things used by inetd and non-inetd modes */
++#ifdef __ORBIS__
++static void ps4_server_stage(const char *stage) {
++	int fd = open("/data/dropbear/dropbear-runtime.log", O_WRONLY | O_APPEND);
++	if (fd >= 0) {
++		(void)write(fd, stage, strlen(stage));
++		(void)write(fd, "\n", 1);
++		close(fd);
++	}
++}
++
++static void ps4_server_stage_errno(const char *stage, int err) {
++	char marker[96];
++	(void)snprintf(marker, sizeof(marker), "%s errno=%d", stage, err);
++	ps4_server_stage(marker);
++}
++
++static void ps4_server_notify_started(const char *port) {
++	OrbisNotificationRequest req;
++	char marker[64];
++	int result;
++
++	memset(&req, 0, sizeof(req));
++	(void)snprintf(req.message, sizeof(req.message),
++			"Dropbear SSH for PS4 by RuxaXa gestartet - Port %s", port);
++	ps4_server_stage("notification-start");
++	result = sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
++	(void)snprintf(marker, sizeof(marker), "notification-result=%d", result);
++	ps4_server_stage(marker);
++}
++#endif
++
+ static void commonsetup() {
+ 
+ 	struct sigaction sa_chld;
+@@ -445,6 +537,20 @@ static void commonsetup() {
+ 	}
+ #endif
+ 
++	/* Regular PS4 app sandboxes reject some Unix signal registrations. They
++	 * are useful cleanup hooks, but not a prerequisite for binding the test
++	 * listener, so register them best-effort instead of aborting startup. */
++#ifdef __ORBIS__
++	(void)signal(SIGINT, sigintterm_handler);
++	(void)signal(SIGTERM, sigintterm_handler);
++	(void)signal(SIGPIPE, SIG_IGN);
++	sa_chld.sa_handler = sigchld_handler;
++	sa_chld.sa_flags = SA_NOCLDSTOP;
++	(void)sigemptyset(&sa_chld.sa_mask);
++	(void)sigaction(SIGCHLD, &sa_chld, NULL);
++	(void)signal(SIGSEGV, sigsegv_handler);
++	ps4_server_stage("signal-setup-done");
++#else
+ 	/* set up cleanup handler */
+ 	if (signal(SIGINT, sigintterm_handler) == SIG_ERR || 
+ #ifndef DEBUG_VALGRIND
+@@ -464,12 +570,19 @@ static void commonsetup() {
+ 	if (signal(SIGSEGV, sigsegv_handler) == SIG_ERR) {
+ 		dropbear_exit("signal() error");
+ 	}
++#endif
+ 
+ 	crypto_init();
++#ifdef __ORBIS__
++	ps4_server_stage("crypto-init-done");
++#endif
+ 
+ 	/* Now we can setup the hostkeys - needs to be after logging is on,
+ 	 * otherwise we might end up blatting error messages to the socket */
+ 	load_all_hostkeys();
++#ifdef __ORBIS__
++	ps4_server_stage("hostkeys-done");
++#endif
+ }
+ 
+ /* Set up listening sockets for all the requested ports */
+diff --git a/src/svr-session.c b/src/svr-session.c
+index c1cd6b9..d66eade 100644
+--- a/src/svr-session.c
++++ b/src/svr-session.c
+@@ -42,6 +42,13 @@
+ #include "crypto_desc.h"
+ #include "fuzz.h"
+ 
++#ifdef __ORBIS__
++#include "ps4-runtime.h"
++#include <setjmp.h>
++extern jmp_buf ps4_session_jmp;
++extern volatile int ps4_session_active;
++#endif
++
+ static void svr_remoteclosed(void);
+ static void svr_algos_initialise(void);
+ 
+@@ -109,7 +116,13 @@ void svr_session(int sock, int childpipe) {
+ 	char *host, *port;
+ 	size_t len;
+ 
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-session-enter", 0);
++#endif
+ 	common_session_init(sock, sock);
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-common-init-done", 0);
++#endif
+ 
+ 	/* Initialise server specific parts of the session */
+ 	svr_ses.childpipe = childpipe;
+@@ -118,12 +131,18 @@ void svr_session(int sock, int childpipe) {
+ #endif
+ 
+ 	/* for logging the remote address */
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-address-start", 0);
++#endif
+ 	get_socket_address(ses.sock_in, NULL, NULL, &host, &port, 0);
+ 	len = strlen(host) + strlen(port) + 2;
+ 	svr_ses.addrstring = m_malloc(len);
+ 	snprintf(svr_ses.addrstring, len, "%s:%s", host, port);
+ 	m_free(host);
+ 	m_free(port);
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-address-done", 0);
++#endif
+ 
+ #if DROPBEAR_PLUGIN
+         /* Initializes the PLUGIN Plugin */
+@@ -170,13 +189,22 @@ void svr_session(int sock, int childpipe) {
+         }
+ #endif
+ 
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-components-start", 0);
++#endif
+ 	svr_authinitialise();
+ 	chaninitialise(svr_chantypes);
+ 	svr_chansessinitialise();
+ 	svr_algos_initialise();
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-components-done", 0);
++#endif
+ 
+ 	get_socket_address(ses.sock_in, NULL, NULL, 
+ 			&svr_ses.remotehost, NULL, 1);
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-remotehost-done", 0);
++#endif
+ 
+ 	/* set up messages etc */
+ 	ses.remoteclosed = svr_remoteclosed;
+@@ -191,12 +219,24 @@ void svr_session(int sock, int childpipe) {
+ 	ses.init_done = 1;
+ 
+ 	/* exchange identification, version etc */
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-ident-start", 0);
++#endif
+ 	send_session_identification();
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-ident-queued", 0);
++#endif
+ 	
+ 	kexfirstinitialise(); /* initialise the kex state */
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-kexfirst-done", 0);
++#endif
+ 
+ 	/* start off with key exchange */
+ 	send_msg_kexinit();
++#ifdef __ORBIS__
++	ps4_runtime_errno_marker("svr-kexinit-queued", 0);
++#endif
+ 
+ #if DROPBEAR_FUZZ
+     if (fuzz.fuzzing) {
+@@ -259,7 +299,22 @@ void svr_dropbear_exit(int exitcode, const char* format, va_list param) {
+ 		add_delay = 1;
+ 	}
+ 
++#ifdef __ORBIS__
++	/* PS4 app stdio/syslog paths are not reliable enough for fatal startup
++	 * diagnostics. Persist the actual cause before exit(3) reaches the
++	 * sandbox's forbidden _exit path. */
++	{
++		int fd = open("/data/dropbear/dropbear-runtime.log", O_WRONLY | O_APPEND);
++		if (fd >= 0) {
++			(void)write(fd, "fatal: ", 7);
++			(void)write(fd, fullmsg, strlen(fullmsg));
++			(void)write(fd, "\n", 1);
++			(void)close(fd);
++		}
++	}
++#else
+ 	dropbear_log(LOG_INFO, "%s", fullmsg);
++#endif
+ 
+ 	/* To make it harder for attackers, introduce a delay to keep an
+ 	 * unauthenticated session open a bit longer, thus blocking a connection
+@@ -289,6 +344,13 @@ void svr_dropbear_exit(int exitcode, const char* format, va_list param) {
+ 		session_cleanup();
+ 	}
+ 
++#ifdef __ORBIS__
++	if (ps4_session_active) {
++		ps4_session_active = 0;
++		longjmp(ps4_session_jmp, 1);
++	}
++#endif
++
+ #if DROPBEAR_FUZZ
+ 	/* longjmp before cleaning up svr_opts */
+     if (fuzz.do_jmp) {
+@@ -362,6 +424,33 @@ static void svr_remoteclosed() {
+ 
+ static void svr_algos_initialise(void) {
+ 	algo_type *algo;
++#ifdef __ORBIS__
++	/* PS4 runtime diagnostics observed every static usability byte cleared at
++	 * KEX time. Each table already contains only algorithms compiled into this
++	 * binary, so restore those build-time defaults immediately before KEX. */
++	for (algo = sshkex; algo->name; algo++) algo->usable = 1;
++	for (algo = sigalgs; algo->name; algo++) {
++		algo->usable = 1;
++#if DROPBEAR_ED25519
++		if (strcmp(algo->name, "ssh-ed25519") == 0) {
++			algo->val = DROPBEAR_SIGNATURE_ED25519;
++		}
++#if DROPBEAR_SK_ED25519
++		else if (strcmp(algo->name, "sk-ssh-ed25519@openssh.com") == 0) {
++			algo->val = DROPBEAR_SIGNATURE_SK_ED25519;
++		}
++#endif
++#endif
++#if DROPBEAR_RSA && DROPBEAR_RSA_SHA256
++		else if (strcmp(algo->name, "rsa-sha2-256") == 0) {
++			algo->val = DROPBEAR_SIGNATURE_RSA_SHA256;
++		}
++#endif
++	}
++	for (algo = sshciphers; algo->name; algo++) algo->usable = 1;
++	for (algo = sshhashes; algo->name; algo++) algo->usable = 1;
++	for (algo = ssh_nocompress; algo->name; algo++) algo->usable = 1;
++#endif
+ 	for (algo = sshkex; algo->name; algo++) {
+ #if DROPBEAR_DH_GROUP1 && DROPBEAR_DH_GROUP1_CLIENTONLY
+ 		if (strcmp(algo->name, "diffie-hellman-group1-sha1") == 0) {

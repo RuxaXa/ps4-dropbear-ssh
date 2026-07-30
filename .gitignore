@@ -1,0 +1,50 @@
+# Secrets and identities
+*.key
+*.pem
+*.p12
+*.pfx
+*.env
+.env*
+authorized_keys
+known_hosts
+
+# Console/package binaries are release assets, never Git blobs
+*.PUP
+*.pup
+*.SELF
+*.self
+*.SPRX
+*.sprx
+*.PRX
+*.prx
+*.pkg
+*.fself
+*.sfo
+*.rif
+*.keystone
+*.dec
+*.bin
+*.elf
+*.img
+
+# Generated build files
+*.o
+*.a
+*.so
+*.lo
+*.la
+*.gcda
+*.gcno
+*.pyc
+__pycache__/
+config.h
+config.log
+config.status
+Makefile
+localoptions.h
+
+# Keep reviewed PS4 build helpers despite broad upstream patterns
+!dropbear/build-aux/
+!dropbear/build-aux/**
+
+.DS_Store
