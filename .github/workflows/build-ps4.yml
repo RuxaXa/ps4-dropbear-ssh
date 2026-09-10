@@ -124,6 +124,70 @@ jobs:
           sha256sum * | tee SHA256SUMS
           ls -la
 
+      - name: Build installer + v1.08 PKG
+        working-directory: packaging/installer-v107
+        run: |
+          set -euo pipefail
+          OO="$OO_PS4_TOOLCHAIN"
+          export PATH="$PATH:$OO/bin/linux:$OO/bin:$HOME/.dotnet"
+          VERSION=1.08
+          CONTENT_ID="IV0000-BREW00010_00-DROPBEARSSH00000"
+
+          # locate PkgTool.Core
+          PKGTOOL=""
+          for c in "$OO/bin/linux/PkgTool.Core" "$OO/bin/PkgTool.Core" "$OO/PkgTool.Core"; do
+            [ -f "$c" ] && { PKGTOOL="$c"; break; }
+          done
+          if [ -z "$PKGTOOL" ]; then PKGTOOL="$(find "$OO" -name 'PkgTool.Core*' -type f 2>/dev/null | head -1 || true)"; fi
+          echo "PkgTool.Core: ${PKGTOOL:-NOT FOUND}"
+          test -n "$PKGTOOL" || { find "$OO" -maxdepth 3 -type d; exit 1; }
+          chmod +x "$PKGTOOL" || true
+
+          # 1) daemon: reuse the dropbear FSELF from the build step
+          cp ../../out/dropbearmulti daemon.elf
+          create-fself -in=daemon.elf -eboot daemon.bin
+          file daemon.bin || true
+
+          # 2) installer (main_install + kern_orbis) with the OpenOrbis clang wrapper
+          CC="../../dropbear/build-aux/ps4-clang-wrap.sh"
+          CFLAGS="-target x86_64-scei-ps4-elf -funwind-tables -fuse-init-array -isysroot $OO -isystem $OO/include -I. -Wall -DTITLE_ID=\"BREW00010\""
+          "$CC" -c main_install.c -o main_install.o $CFLAGS
+          "$CC" -c kern_orbis.c  -o kern_orbis.o  $CFLAGS
+          LLD="$(command -v ld.lld || command -v ld.lld-18 || echo /usr/bin/ld.lld)"
+          "$LLD" -o install.elf -m elf_x86_64 -pie --eh-frame-hdr \
+            --script "$OO/link.x" "$OO/lib/crt1.o" "$OO/lib/crti.o" \
+            -L"$OO/lib" main_install.o kern_orbis.o -lkernel -lSceSystemService -lc \
+            "$OO/lib/crtn.o"
+          create-fself -in=install.elf -eboot install.bin
+
+          # 3) SFOs
+          sfo() {
+            "$PKGTOOL" sfo_new "$1"
+            "$PKGTOOL" sfo_setentry "$1" APP_TYPE --type Integer --maxsize 4 --value "$2"
+            "$PKGTOOL" sfo_setentry "$1" APP_VER --type Utf8 --maxsize 8 --value "$VERSION"
+            "$PKGTOOL" sfo_setentry "$1" ATTRIBUTE --type Integer --maxsize 4 --value 0
+            "$PKGTOOL" sfo_setentry "$1" CATEGORY --type Utf8 --maxsize 4 --value "$3"
+            "$PKGTOOL" sfo_setentry "$1" CONTENT_ID --type Utf8 --maxsize 48 --value "$4"
+            "$PKGTOOL" sfo_setentry "$1" DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
+            "$PKGTOOL" sfo_setentry "$1" TITLE --type Utf8 --maxsize 128 --value "Dropbear SSH"
+            "$PKGTOOL" sfo_setentry "$1" TITLE_ID --type Utf8 --maxsize 12 --value "BREW00010"
+            "$PKGTOOL" sfo_setentry "$1" VERSION --type Utf8 --maxsize 8 --value "$VERSION"
+          }
+          sfo install.sfo 1 gd "$CONTENT_ID"
+          sfo daemon.sfo  0 gdd ""
+          "$PKGTOOL" sfo_setentry daemon.sfo FORMAT --type Utf8 --maxsize 4 --value "ngh"
+
+          # 4) PRX + icon
+          cp "$OO/src/modules/libc.prx" . ; cp "$OO/src/modules/libSceFios2.prx" .
+          ls -l icon0.png
+
+          # 5) build the PKG
+          "$PKGTOOL" pkg_build install.gp4 .
+          ls -la *.pkg || true
+
+          mkdir -p ../../out
+          cp -v *.pkg ../../out/ || true
+
       - uses: actions/upload-artifact@v4
         with:
           name: dropbear-ps4
