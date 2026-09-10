@@ -1076,7 +1076,8 @@ static int ps4_format_command(struct ChanSess *chansess, const char *cmd,
 	} else if (strcmp(cmd, "help") == 0) {
 		len = snprintf(output, output_size,
 				"Built-ins: pwd cd ls [-la] cat head tail stat hexdump grep find touch "
-				"mkdir rmdir rm cp mv chmod id whoami uname echo true false help exit\n");
+				"mkdir rmdir rm cp mv chmod id whoami uname echo true false help exit\n"
+				"run <elf> [args...] - start an ELF binary as a child process\n");
 	} else if (*cmd == '\0') {
 		len = 0;
 	} else {

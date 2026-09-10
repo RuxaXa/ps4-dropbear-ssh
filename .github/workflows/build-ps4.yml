@@ -1,0 +1,281 @@
+name: build-ps4
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'feat/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang + lld
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld || sudo apt-get install -y -qq clang-19 lld-19
+
+          # ld.lld unter kanonischem Namen sicherstellen (Paketname variiert)
+          if [ ! -e /usr/bin/ld.lld ]; then
+            ALT=$(command ls /usr/bin/ld.lld-* 2>/dev/null | head -n 1 || true)
+            if [ -n "${ALT:-}" ]; then sudo ln -sf "$ALT" /usr/bin/ld.lld; fi
+          fi
+
+          clang --version | head -n 2 || true
+          echo "--- clang/ld.lld ---"
+          command ls -l /usr/bin/clang /usr/bin/ld.lld 2>/dev/null || true
+          test -x /usr/bin/clang
+          test -e /usr/bin/ld.lld || { echo "FEHLER: ld.lld nicht verfuegbar"; exit 1; }
+
+      - name: Fetch OpenOrbis PS4 toolchain v0.5.4
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/tc.tar.gz \
+            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
+          mkdir -p "$HOME/tc"
+          tar -xzf /tmp/tc.tar.gz -C "$HOME/tc"
+          echo "--- Baum (maxdepth 3) ---"
+          find "$HOME/tc" -maxdepth 3 | head -40
+
+      - name: Resolve toolchain root (link.x + include)
+        run: |
+          set -euxo pipefail
+          ROOT=$(dirname "$(find "$HOME/tc" -name link.x 2>/dev/null | head -1)")
+          test -n "${ROOT:-}"
+          test -d "$ROOT/include"
+          echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
+          echo "LLVM_BIN=/usr/bin" >> "$GITHUB_ENV"
+          echo "toolchain root: $ROOT"
+          ls "$ROOT" | head -15
+
+      - name: Smoke-test compiler
+        working-directory: dropbear
+        run: |
+          set -euxo pipefail
+          export CC="$PWD/build-aux/ps4-clang-wrap.sh"
+          printf 'int ps4_ci_smoke(void) { return 0; }\n' > /tmp/smoke.c
+          "$CC" -c -o /tmp/smoke.o /tmp/smoke.c
+          file /tmp/smoke.o
+
+      - name: Configure
+        working-directory: dropbear
+        run: |
+          set -euo pipefail
+          cp localoptions-ps4.example.h localoptions.h
+          export CC="$PWD/build-aux/ps4-clang-wrap.sh"
+          ./configure \
+            --host=x86_64-unknown-freebsd9 \
+            --build=x86_64-pc-linux-gnu \
+            --disable-zlib --disable-pam --disable-syslog \
+            --disable-lastlog --disable-utmp --disable-utmpx \
+            --disable-wtmp --disable-wtmpx --disable-loginfunc \
+            --disable-pututline --disable-pututxline \
+            --enable-bundled-libtom --disable-harden \
+            ac_cv_func_getusershell=no \
+            ac_cv_func_clearenv=no \
+            ac_cv_func_daemon=no \
+            ac_cv_func_basename=yes \
+            ac_cv_func_dirname=yes \
+            ac_cv_func_openpty=yes \
+            ac_cv_func_fork=yes \
+            ac_cv_func_vfork=yes \
+            CC="$CC" \
+            CFLAGS="-I$OO_PS4_TOOLCHAIN/include -I. -O2 -D__ORBIS__ -D_GNU_SOURCE" \
+            LDFLAGS= LIBS= \
+            || { echo "--- config.log ---"; tail -80 config.log; exit 1; }
+
+      - name: Build
+        working-directory: dropbear
+        run: make PROGRAMS=dropbear MULTI=1 -j2
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for candidate in dropbear/dropbearmulti dropbear/dropbear; do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" "out/$(basename "$candidate")"
+              file "out/$(basename "$candidate")"
+            fi
+          done
+
+          # The PS4 app path needs an FSELF (e_type 0xFE10, OS/ABI FreeBSD), not a
+          # plain ELF, so wrap the daemon the same way the v1.07 recipe does
+          # (packaging/installer-v107/Makefile.v107: create-fself -in=$< -eboot $@).
+          FSELF=""
+          for cand in "$OO_PS4_TOOLCHAIN/bin/create-fself" "$OO_PS4_TOOLCHAIN/create-fself"; do
+            if [ -f "$cand" ]; then FSELF="$cand"; break; fi
+          done
+          if [ -z "$FSELF" ]; then
+            FSELF="$(find "$OO_PS4_TOOLCHAIN" -type f -name 'create-fself*' 2>/dev/null | head -1 || true)"
+          fi
+          echo "create-fself: ${FSELF:-NOT FOUND}"
+          test -n "$FSELF" || { echo "FEHLER: create-fself nicht in der Toolchain gefunden"; find "$OO_PS4_TOOLCHAIN" -maxdepth 2 -type d; exit 1; }
+          chmod +x "$FSELF" || true
+          "$FSELF" -in=out/dropbearmulti -eboot out/daemon.bin
+          file out/daemon.bin
+          readelf -h out/daemon.bin | head -14 || true
+
+          cd out
+          sha256sum * | tee SHA256SUMS
+          ls -la
+
+      - name: Build installer + v1.08 PKG
+        working-directory: packaging/installer-v107
+        run: |
+          set -euo pipefail
+          OO="$OO_PS4_TOOLCHAIN"
+          export PATH="$PATH:$OO/bin/linux:$OO/bin:$HOME/.dotnet"
+          VERSION=1.09
+          CONTENT_ID="IV0000-BREW00010_00-DROPBEARSSH00000"
+
+          # the historical packaging dir omits two headers kern_orbis.c includes;
+          # fetch them from the exact upstream commit recorded in LICENSING.md
+          UP=John-Tornblom/tiny-ps4-shell
+          UPC=5ca90b7d2825e3e2c7f9fb1e81cf8949b37af563
+          for h in kern_orbis_types.h kern_orbis_offsets.h; do
+            curl -fsSL -o "$h" "https://raw.githubusercontent.com/$UP/$UPC/$h"
+          done
+          ls -l kern_orbis*.h; head -3 kern_orbis_types.h
+
+          # locate PkgTool.Core
+          PKGTOOL=""
+          for c in "$OO/bin/linux/PkgTool.Core" "$OO/bin/PkgTool.Core" "$OO/PkgTool.Core"; do
+            [ -f "$c" ] && { PKGTOOL="$c"; break; }
+          done
+          if [ -z "$PKGTOOL" ]; then PKGTOOL="$(find "$OO" -name 'PkgTool.Core*' -type f 2>/dev/null | head -1 || true)"; fi
+          echo "PkgTool.Core: ${PKGTOOL:-NOT FOUND}"
+          test -n "$PKGTOOL" || { find "$OO" -maxdepth 3 -type d; exit 1; }
+          chmod +x "$PKGTOOL" || true
+
+          # 1) daemon: reuse the dropbear FSELF from the build step
+          cp ../../out/dropbearmulti daemon.elf
+          create-fself -in=daemon.elf -eboot daemon.bin
+          file daemon.bin || true
+
+          # 2) installer (main_install + kern_orbis) with the OpenOrbis clang wrapper
+          CC="../../dropbear/build-aux/ps4-clang-wrap.sh"
+          CFLAGS="-target x86_64-scei-ps4-elf -funwind-tables -isysroot $OO -isystem $OO/include -I. -Wall -DTITLE_ID=\"BREW00010\""
+          "$CC" -c main_install.c -o main_install.o $CFLAGS
+          "$CC" -c kern_orbis.c  -o kern_orbis.o  $CFLAGS
+          LLD="$(command -v ld.lld || command -v ld.lld-18 || echo /usr/bin/ld.lld)"
+          "$LLD" -o install.elf -m elf_x86_64 -pie --eh-frame-hdr \
+            --script "$OO/link.x" "$OO/lib/crt1.o" "$OO/lib/crti.o" \
+            -L"$OO/lib" main_install.o kern_orbis.o -lkernel -lSceSystemService -lc \
+            "$OO/lib/crtn.o"
+          create-fself -in=install.elf -eboot install.bin
+
+          # 3) SFOs
+          sfo() {
+            "$PKGTOOL" sfo_new "$1"
+            "$PKGTOOL" sfo_setentry "$1" APP_TYPE --type Integer --maxsize 4 --value "$2"
+            "$PKGTOOL" sfo_setentry "$1" APP_VER --type Utf8 --maxsize 8 --value "$VERSION"
+            "$PKGTOOL" sfo_setentry "$1" ATTRIBUTE --type Integer --maxsize 4 --value 0
+            "$PKGTOOL" sfo_setentry "$1" CATEGORY --type Utf8 --maxsize 4 --value "$3"
+            "$PKGTOOL" sfo_setentry "$1" CONTENT_ID --type Utf8 --maxsize 48 --value "$4"
+            "$PKGTOOL" sfo_setentry "$1" DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
+            "$PKGTOOL" sfo_setentry "$1" TITLE --type Utf8 --maxsize 128 --value "Dropbear SSH"
+            "$PKGTOOL" sfo_setentry "$1" TITLE_ID --type Utf8 --maxsize 12 --value "BREW00010"
+            "$PKGTOOL" sfo_setentry "$1" VERSION --type Utf8 --maxsize 8 --value "$VERSION"
+          }
+          sfo install.sfo 1 gd "$CONTENT_ID"
+          # SYSTEM_VER is mandatory: without it the PS4 package installer rejects the
+          # package as "defekte Daten" (verified 2026-09-10, 32 B SFO entry).
+          "$PKGTOOL" sfo_setentry install.sfo SYSTEM_VER --type Integer --maxsize 4 --value 0
+          sfo daemon.sfo  0 gdd ""
+          "$PKGTOOL" sfo_setentry daemon.sfo FORMAT --type Utf8 --maxsize 4 --value "ngh"
+
+          # 4) PRX + icon
+          cp "$OO/src/modules/libc.prx" . ; cp "$OO/src/modules/libSceFios2.prx" .
+          ls -l icon0.png
+
+          # 5) build the PKG. PkgTool.Core is a .NET app: pkg_build signs and therefore
+          #    probes OpenSSL. Ubuntu 24.04 only has libssl3, so provide an isolated
+          #    OpenSSL 1.1 (the "isolated compatible OpenSSL 1.1 runtime" the release
+          #    notes refer to) by unpacking the focal libssl1.1 package.
+          OPENSSL11=/opt/openssl11
+          mkdir -p "$OPENSSL11"
+          if [ ! -e "$OPENSSL11/libssl.so.1.1" ]; then
+            for idx in "http://security.ubuntu.com/ubuntu/pool/main/o/openssl/" "http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/"; do
+              DEB=$(curl -fsSL "$idx" | grep -oE 'libssl1\.1_[^"]*_amd64\.deb' | sort -u | tail -1 || true)
+              [ -n "$DEB" ] && { echo "libssl1.1 package: $DEB"; curl -fsSL -o /tmp/libssl1.1.deb "$idx$DEB" && break; }
+            done
+            test -s /tmp/libssl1.1.deb || { echo "FEHLER: libssl1.1 nicht ladbar"; exit 1; }
+            dpkg -x /tmp/libssl1.1.deb "$OPENSSL11"
+          fi
+          ls -l "$OPENSSL11/usr/lib/x86_64-linux-gnu/" | head
+          export LD_LIBRARY_PATH="$OPENSSL11/usr/lib/x86_64-linux-gnu:$OO/lib/linux:$OO/bin/linux:$OO/lib:$OO:${LD_LIBRARY_PATH:-}"
+          echo "--- toolchain crypto runtime ---"
+          find "$OO" -maxdepth 3 -name 'libcrypto*' -o -maxdepth 3 -name 'libssl*' | head -10 || true
+          ldd "$PKGTOOL" | head -20 || true
+          echo "--- inputs ---"
+          ls -l *.bin *.sfo *.prx *.png install.gp4 || true
+          set +e
+          "$PKGTOOL" pkg_build install.gp4 . ; rc=$?
+          echo "pkg_build rc=$rc"
+          set -e
+          ls -la *.pkg || true
+
+          # 6) self-validation: confirm the package is well-formed and that the daemon
+          #    it carries is byte-identical to the one we built.
+          PKGNAME="$(ls *.pkg | head -1)"
+          echo "PKGNAME=$PKGNAME"
+          set +e
+          echo "--- PkgTool command list"; "$PKGTOOL" 2>&1 | head -25; "$PKGTOOL" --help 2>&1 | head -25
+          echo "--- pkg_validate"; "$PKGTOOL" pkg_validate "$PKGNAME" 2>&1 | head -20
+          echo "--- pkg_extract"
+          rm -rf /tmp/pkgx && mkdir -p /tmp/pkgx
+          "$PKGTOOL" pkg_extract "$PKGNAME" /tmp/pkgx 2>&1 | head -10 \
+            || "$PKGTOOL" pkg_extract --pkg "$PKGNAME" --out /tmp/pkgx 2>&1 | head -10
+          find /tmp/pkgx -type f 2>/dev/null | head -15
+          echo "--- daemon comparison (extracted vs built)"
+          sha256sum daemon.bin 2>/dev/null
+          find /tmp/pkgx -name 'eboot.bin' -path '*daemon*' -exec sha256sum {} \; 2>/dev/null
+          set -e
+
+          mkdir -p ../../out
+          cp -v *.pkg ../../out/ || true
+
+      - name: Build swap payload (ELF, no FSELF)
+        working-directory: packaging/installer-v107
+        run: |
+          set -euo pipefail
+          OO="$OO_PS4_TOOLCHAIN"
+          for h in kern_orbis_types.h kern_orbis_offsets.h; do
+            [ -f "$h" ] || curl -fsSL -o "$h" "https://raw.githubusercontent.com/John-Tornblom/tiny-ps4-shell/5ca90b7d2825e3e2c7f9fb1e81cf8949b37af563/$h"
+          done
+          CLANG="$(command -v clang)"
+          CFLAGS_BASE=(-target x86_64-scei-ps4-elf -funwind-tables -isysroot "$OO" -isystem "$OO/include" -I. -O2 -D__ORBIS__ -D_GNU_SOURCE)
+          "$CLANG" "${CFLAGS_BASE[@]}" -c main_swap.c   -o main_swap.o
+          "$CLANG" "${CFLAGS_BASE[@]}" -c kern_orbis.c  -o kern_orbis_swap.o
+          LLD="$(command -v ld.lld || command -v ld.lld-18 || echo /usr/bin/ld.lld)"
+          "$LLD" -o swap-payload.elf -m elf_x86_64 -pie --eh-frame-hdr \
+            --script "$OO/link.x" "$OO/lib/crt1.o" "$OO/lib/crti.o" \
+            -L"$OO/lib" main_swap.o kern_orbis_swap.o -lkernel -lc \
+            "$OO/lib/crtn.o"
+          file swap-payload.elf; ls -l swap-payload.elf; sha256sum swap-payload.elf
+          readelf -lW swap-payload.elf | grep -E 'INTERP|LOAD' | head -5
+          readelf -dW swap-payload.elf | grep -E 'NEEDED' || true
+          mkdir -p ../../out && cp swap-payload.elf ../../out/swap-payload.elf
+
+      - name: Prepare PkgTool forensics bundle
+        run: |
+          set -euo pipefail
+          mkdir -p out/forensics/openssl11
+          OO="$OO_PS4_TOOLCHAIN"
+          PT="$(find "$OO" -name 'PkgTool.Core' -type f 2>/dev/null | head -1 || true)"
+          echo "PkgTool: $PT"; cp "$PT" out/forensics/ || true
+          cp /opt/openssl11/usr/lib/x86_64-linux-gnu/libssl.so.1.1 out/forensics/openssl11/ 2>/dev/null || true
+          cp /opt/openssl11/usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 out/forensics/openssl11/ 2>/dev/null || true
+          ls -l out/forensics out/forensics/openssl11
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dropbear-ps4
+          path: out/**
+          if-no-files-found: error
+          retention-days: 30

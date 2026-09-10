@@ -3,6 +3,7 @@
 #endif
 
 #include "ps4-shell.h"
+#include "ps4-runtime.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -202,11 +203,50 @@ static int resolve_arg(const struct ps4_shell_state *state, const char *arg,
 	return ps4_shell_resolve(state->cwd, arg, path, PS4_SHELL_PATH_MAX);
 }
 
+static int command_run(struct ps4_shell_state *state,
+		const struct ps4_shell_args *args, ps4_shell_write_fn writer, void *ctx) {
+	char path[PS4_SHELL_PATH_MAX];
+	char *child_argv[PS4_SHELL_MAX_ARGS + 1];
+	pid_t pid;
+	int status = 0;
+	int count;
+	size_t index;
+
+	if (args->argc < 2) {
+		return shell_error(writer, ctx, "run", "(no file)", EINVAL);
+	}
+	if (resolve_arg(state, args->argv[1], path) != 0) {
+		return shell_error(writer, ctx, "run", args->argv[1], errno);
+	}
+	count = args->argc - 1;
+	if (count > PS4_SHELL_MAX_ARGS) {
+		count = PS4_SHELL_MAX_ARGS;
+	}
+	for (index = 1; index <= (size_t)count; index++) {
+		child_argv[index - 1] = args->argv[index];
+	}
+	child_argv[count] = NULL;
+
+	pid = ps4_fork();
+	if (pid < 0) {
+		return shell_error(writer, ctx, "run", args->argv[1], errno);
+	}
+	if (pid == 0) {
+		ps4_execv(path, child_argv);
+		ps4_exit(127);
+	}
+	if (ps4_waitpid(pid, &status) < 0) {
+		return shell_error(writer, ctx, "run", args->argv[1], errno);
+	}
+	return write_fmt(writer, ctx, "run: %s exit=%d\n", args->argv[1],
+			(status >> 8) & 0xff) == 0 ? 0 : -1;
+}
+
 int ps4_shell_handles(const char *command) {
 	static const char *const commands[] = {
 		"pwd", "cd", "ls", "cat", "head", "tail", "stat",
 		"touch", "mkdir", "rmdir", "rm", "cp", "mv", "chmod",
-		"grep", "hexdump", "find"
+		"grep", "hexdump", "find", "run"
 	};
 	struct ps4_shell_args args;
 	size_t index;
@@ -657,6 +697,9 @@ int ps4_shell_execute(struct ps4_shell_state *state, const char *command,
 				first, S_ISDIR(st.st_mode) ? "directory" : S_ISREG(st.st_mode) ? "file" : "other",
 				(unsigned int)(st.st_mode & 07777), (long long)st.st_size,
 				(long long)st.st_mtime) == 0 ? 0 : -1;
+	}
+	if (strcmp(args.argv[0], "run") == 0 && args.argc >= 2) {
+		return command_run(state, &args, writer, writer_ctx);
 	}
 invalid:
 	if (write_fmt(writer, writer_ctx, "%s: command not found or invalid arguments\n", args.argv[0]) != 0) return -1;
