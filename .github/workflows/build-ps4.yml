@@ -190,8 +190,18 @@ jobs:
           cp "$OO/src/modules/libc.prx" . ; cp "$OO/src/modules/libSceFios2.prx" .
           ls -l icon0.png
 
-          # 5) build the PKG
-          "$PKGTOOL" pkg_build install.gp4 .
+          # 5) build the PKG. pkg_build signs the package, so it needs the
+          #    isolated OpenSSL 1.1 runtime shipped inside the toolchain.
+          export LD_LIBRARY_PATH="$OO/lib/linux:$OO/bin/linux:$OO/lib:$OO:${LD_LIBRARY_PATH:-}"
+          echo "--- toolchain crypto runtime ---"
+          find "$OO" -maxdepth 3 -name 'libcrypto*' -o -maxdepth 3 -name 'libssl*' | head -10 || true
+          ldd "$PKGTOOL" | head -20 || true
+          echo "--- inputs ---"
+          ls -l *.bin *.sfo *.prx *.png install.gp4 || true
+          set +e
+          "$PKGTOOL" pkg_build install.gp4 . ; rc=$?
+          echo "pkg_build rc=$rc"
+          set -e
           ls -la *.pkg || true
 
           mkdir -p ../../out
