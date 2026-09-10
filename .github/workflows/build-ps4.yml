@@ -240,6 +240,26 @@ jobs:
           mkdir -p ../../out
           cp -v *.pkg ../../out/ || true
 
+      - name: Build swap payload (ELF, no FSELF)
+        working-directory: packaging/installer-v107
+        run: |
+          set -euo pipefail
+          OO="$OO_PS4_TOOLCHAIN"
+          for h in kern_orbis_types.h kern_orbis_offsets.h; do
+            [ -f "$h" ] || curl -fsSL -o "$h" "https://raw.githubusercontent.com/John-Tornblom/tiny-ps4-shell/5ca90b7d2825e3e2c7f9fb1e81cf8949b37af563/$h"
+          done
+          CLANG="$(command -v clang)"
+          CFLAGS_BASE=(-target x86_64-scei-ps4-elf -funwind-tables -isysroot "$OO" -isystem "$OO/include" -I. -O2 -D__ORBIS__ -D_GNU_SOURCE)
+          "$CLANG" "${CFLAGS_BASE[@]}" -c main_swap.c   -o main_swap.o
+          "$CLANG" "${CFLAGS_BASE[@]}" -c kern_orbis.c  -o kern_orbis_swap.o
+          LLD="$(command -v ld.lld || command -v ld.lld-18 || echo /usr/bin/ld.lld)"
+          "$LLD" -o swap-payload.elf -m elf_x86_64 -pie --eh-frame-hdr \
+            --script "$OO/link.x" "$OO/lib/crt1.o" "$OO/lib/crti.o" \
+            -L"$OO/lib" main_swap.o kern_orbis_swap.o -lkernel -lSceSystemService -lc \
+            "$OO/lib/crtn.o"
+          file swap-payload.elf; ls -l swap-payload.elf; sha256sum swap-payload.elf
+          mkdir -p ../../out && cp swap-payload.elf ../../out/swap-payload.elf
+
       - name: Prepare PkgTool forensics bundle
         run: |
           set -euo pipefail
