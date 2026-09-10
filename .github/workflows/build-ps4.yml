@@ -102,6 +102,24 @@ jobs:
               file "out/$(basename "$candidate")"
             fi
           done
+
+          # The PS4 app path needs an FSELF (e_type 0xFE10, OS/ABI FreeBSD), not a
+          # plain ELF, so wrap the daemon the same way the v1.07 recipe does
+          # (packaging/installer-v107/Makefile.v107: create-fself -in=$< -eboot $@).
+          FSELF=""
+          for cand in "$OO_PS4_TOOLCHAIN/bin/create-fself" "$OO_PS4_TOOLCHAIN/create-fself"; do
+            if [ -f "$cand" ]; then FSELF="$cand"; break; fi
+          done
+          if [ -z "$FSELF" ]; then
+            FSELF="$(find "$OO_PS4_TOOLCHAIN" -type f -name 'create-fself*' 2>/dev/null | head -1 || true)"
+          fi
+          echo "create-fself: ${FSELF:-NOT FOUND}"
+          test -n "$FSELF" || { echo "FEHLER: create-fself nicht in der Toolchain gefunden"; find "$OO_PS4_TOOLCHAIN" -maxdepth 2 -type d; exit 1; }
+          chmod +x "$FSELF" || true
+          "$FSELF" -in=out/dropbearmulti -eboot out/daemon.bin
+          file out/daemon.bin
+          readelf -h out/daemon.bin | head -14 || true
+
           cd out
           sha256sum * | tee SHA256SUMS
           ls -la
