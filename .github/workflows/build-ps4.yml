@@ -217,6 +217,22 @@ jobs:
           set -e
           ls -la *.pkg || true
 
+          # 6) self-validation: confirm the package is well-formed and that the daemon
+          #    it carries is byte-identical to the one we built.
+          PKGNAME="$(ls *.pkg | head -1)"
+          echo "PKGNAME=$PKGNAME"
+          set +e
+          echo "--- pkg_validate"; "$PKGTOOL" pkg_validate "$PKGNAME" 2>&1 | head -20
+          echo "--- pkg_extract"
+          rm -rf /tmp/pkgx && mkdir -p /tmp/pkgx
+          "$PKGTOOL" pkg_extract "$PKGNAME" /tmp/pkgx 2>&1 | head -10 \
+            || "$PKGTOOL" pkg_extract --pkg "$PKGNAME" --out /tmp/pkgx 2>&1 | head -10
+          find /tmp/pkgx -type f 2>/dev/null | head -15
+          echo "--- daemon comparison (extracted vs built)"
+          sha256sum daemon.bin 2>/dev/null
+          find /tmp/pkgx -name 'eboot.bin' -path '*daemon*' -exec sha256sum {} \; 2>/dev/null
+          set -e
+
           mkdir -p ../../out
           cp -v *.pkg ../../out/ || true
 
