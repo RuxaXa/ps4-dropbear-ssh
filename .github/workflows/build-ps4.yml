@@ -133,6 +133,15 @@ jobs:
           VERSION=1.08
           CONTENT_ID="IV0000-BREW00010_00-DROPBEARSSH00000"
 
+          # the historical packaging dir omits two headers kern_orbis.c includes;
+          # fetch them from the exact upstream commit recorded in LICENSING.md
+          UP=John-Tornblom/tiny-ps4-shell
+          UPC=5ca90b7d2825e3e2c7f9fb1e81cf8949b37af563
+          for h in kern_orbis_types.h kern_orbis_offsets.h; do
+            curl -fsSL -o "$h" "https://raw.githubusercontent.com/$UP/$UPC/$h"
+          done
+          ls -l kern_orbis*.h; head -3 kern_orbis_types.h
+
           # locate PkgTool.Core
           PKGTOOL=""
           for c in "$OO/bin/linux/PkgTool.Core" "$OO/bin/PkgTool.Core" "$OO/PkgTool.Core"; do
