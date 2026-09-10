@@ -130,7 +130,7 @@ jobs:
           set -euo pipefail
           OO="$OO_PS4_TOOLCHAIN"
           export PATH="$PATH:$OO/bin/linux:$OO/bin:$HOME/.dotnet"
-          VERSION=1.08
+          VERSION=1.09
           CONTENT_ID="IV0000-BREW00010_00-DROPBEARSSH00000"
 
           # the historical packaging dir omits two headers kern_orbis.c includes;
@@ -183,6 +183,9 @@ jobs:
             "$PKGTOOL" sfo_setentry "$1" VERSION --type Utf8 --maxsize 8 --value "$VERSION"
           }
           sfo install.sfo 1 gd "$CONTENT_ID"
+          # SYSTEM_VER is mandatory: without it the PS4 package installer rejects the
+          # package as "defekte Daten" (verified 2026-09-10, 32 B SFO entry).
+          "$PKGTOOL" sfo_setentry install.sfo SYSTEM_VER --type Integer --maxsize 4 --value 0
           sfo daemon.sfo  0 gdd ""
           "$PKGTOOL" sfo_setentry daemon.sfo FORMAT --type Utf8 --maxsize 4 --value "ngh"
 
