@@ -1,0 +1,84 @@
+name: build-ps4
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, 'feat/**' ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch OpenOrbis PS4 toolchain v0.5.4
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/tc.tar.gz \
+            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
+          mkdir -p "$HOME/tc"
+          tar -xzf /tmp/tc.tar.gz -C "$HOME/tc"
+          echo "--- extrahiert ---"
+          find "$HOME/tc" -maxdepth 3 -name 'link.x' -o -maxdepth 3 -name 'clang' -o -maxdepth 3 -name 'ld.lld' | head -20
+
+      - name: Locate toolchain root and LLVM bin
+        run: |
+          set -euo pipefail
+          ROOT=$(dirname "$(find "$HOME/tc" -maxdepth 4 -name 'link.x' | head -1)")
+          LLVM=$(dirname "$(find "$HOME/tc" -maxdepth 5 -name 'ld.lld' | head -1)")
+          test -n "$ROOT" && test -n "$LLVM"
+          echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
+          echo "LLVM_BIN=$LLVM" >> "$GITHUB_ENV"
+          echo "toolchain root: $ROOT"
+          echo "llvm bin:       $LLVM"
+          ls "$ROOT" | head
+
+      - name: Configure (PS4 cross)
+        working-directory: dropbear
+        run: |
+          set -euo pipefail
+          cp localoptions-ps4.example.h localoptions.h
+          export CC="$PWD/build-aux/ps4-clang-wrap.sh"
+          ./configure \
+            --host=x86_64-unknown-freebsd9 \
+            --build=x86_64-pc-linux-gnu \
+            --disable-zlib --disable-pam --disable-syslog \
+            --disable-lastlog --disable-utmp --disable-utmpx \
+            --disable-wtmp --disable-wtmpx --disable-loginfunc \
+            --disable-pututline --disable-pututxline \
+            --enable-bundled-libtom --disable-harden \
+            ac_cv_func_getusershell=no \
+            ac_cv_func_clearenv=no \
+            ac_cv_func_daemon=no \
+            ac_cv_func_basename=yes \
+            ac_cv_func_dirname=yes \
+            ac_cv_func_openpty=yes \
+            ac_cv_func_fork=yes \
+            ac_cv_func_vfork=yes \
+            CC="$CC" \
+            CFLAGS="-I$OO_PS4_TOOLCHAIN/include -I. -O2 -D__ORBIS__ -D_GNU_SOURCE" \
+            LDFLAGS= LIBS=
+
+      - name: Build dropbear (multi)
+        working-directory: dropbear
+        run: |
+          set -euo pipefail
+          make PROGRAMS=dropbear MULTI=1 -j2
+
+      - name: Collect artifacts and hashes
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for f in dropbear/dropbearmulti dropbear/dropbear; do
+            [ -f "$f" ] && cp "$f" "out/$(basename "$f")" && file "out/$(basename "$f")"
+          done
+          (cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dropbear-ps4-${{ github.sha }}
+          path: |
+            out/**
+          if-no-files-found: error
+          retention-days: 30
