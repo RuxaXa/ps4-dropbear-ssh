@@ -255,9 +255,11 @@ jobs:
           LLD="$(command -v ld.lld || command -v ld.lld-18 || echo /usr/bin/ld.lld)"
           "$LLD" -o swap-payload.elf -m elf_x86_64 -pie --eh-frame-hdr \
             --script "$OO/link.x" "$OO/lib/crt1.o" "$OO/lib/crti.o" \
-            -L"$OO/lib" main_swap.o kern_orbis_swap.o -lkernel -lSceSystemService -lc \
+            -L"$OO/lib" main_swap.o kern_orbis_swap.o -lkernel -lc \
             "$OO/lib/crtn.o"
           file swap-payload.elf; ls -l swap-payload.elf; sha256sum swap-payload.elf
+          readelf -lW swap-payload.elf | grep -E 'INTERP|LOAD' | head -5
+          readelf -dW swap-payload.elf | grep -E 'NEEDED' || true
           mkdir -p ../../out && cp swap-payload.elf ../../out/swap-payload.elf
 
       - name: Prepare PkgTool forensics bundle
