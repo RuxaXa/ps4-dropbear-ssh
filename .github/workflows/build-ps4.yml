@@ -150,7 +150,7 @@ jobs:
 
           # 2) installer (main_install + kern_orbis) with the OpenOrbis clang wrapper
           CC="../../dropbear/build-aux/ps4-clang-wrap.sh"
-          CFLAGS="-target x86_64-scei-ps4-elf -funwind-tables -fuse-init-array -isysroot $OO -isystem $OO/include -I. -Wall -DTITLE_ID=\"BREW00010\""
+          CFLAGS="-target x86_64-scei-ps4-elf -funwind-tables -isysroot $OO -isystem $OO/include -I. -Wall -DTITLE_ID=\"BREW00010\""
           "$CC" -c main_install.c -o main_install.o $CFLAGS
           "$CC" -c kern_orbis.c  -o kern_orbis.o  $CFLAGS
           LLD="$(command -v ld.lld || command -v ld.lld-18 || echo /usr/bin/ld.lld)"
