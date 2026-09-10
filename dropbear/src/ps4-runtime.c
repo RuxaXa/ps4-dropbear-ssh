@@ -55,12 +55,14 @@ pid_t ps4_waitpid(pid_t pid, int *status) {
 #ifdef __ORBIS__
     unsigned long ret;
     unsigned char iserror;
+    /* Das vierte Argument des x86-64-Syscall-ABI reist in r10. */
+    register long syscall_arg4 __asm__("r10") = 0;
 
     /* FreeBSD/Orbis SYS_wait4(pid, status, options, rusage). */
     __asm__ __volatile__(
             "syscall"
             : "=a"(ret), "=@ccc"(iserror)
-            : "a"(7L), "D"((long)pid), "S"(status), "d"(0L), "r10"((void *)0)
+            : "a"(7L), "D"((long)pid), "S"(status), "d"(0L), "r"(syscall_arg4)
             : "rcx", "r11", "memory");
     if (iserror) {
         errno = (int)ret;
