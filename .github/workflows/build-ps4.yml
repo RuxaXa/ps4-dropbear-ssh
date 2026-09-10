@@ -18,20 +18,39 @@ jobs:
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
           mkdir -p "$HOME/tc"
           tar -xzf /tmp/tc.tar.gz -C "$HOME/tc"
-          echo "--- extrahiert ---"
-          find "$HOME/tc" -maxdepth 3 -name 'link.x' -o -maxdepth 3 -name 'clang' -o -maxdepth 3 -name 'ld.lld' | head -20
+          echo "--- Baum (1) ---"
+          find "$HOME/tc" -maxdepth 2 | head -30
 
       - name: Locate toolchain root and LLVM bin
         run: |
           set -euo pipefail
-          ROOT=$(dirname "$(find "$HOME/tc" -maxdepth 4 -name 'link.x' | head -1)")
-          LLVM=$(dirname "$(find "$HOME/tc" -maxdepth 5 -name 'ld.lld' | head -1)")
-          test -n "$ROOT" && test -n "$LLVM"
+          ROOT=$(dirname "$(find "$HOME/tc" -name 'link.x' -printf '%h\n' 2>/dev/null | head -1)")
+          test -n "$ROOT"
+          CLANG=$(find "$HOME/tc" -type f -name 'clang*' -perm -u+x 2>/dev/null | head -1)
+          test -n "$CLANG"
+          LLVM=$(dirname "$CLANG")
+          # ld.lld kann als ld.lld-18 o.ae. vorliegen -> kanonischen Namen sicherstellen
+          if [ ! -e "$LLVM/ld.lld" ]; then
+            LLD_ALT=$(find "$HOME/tc" -type f -name 'ld.lld*' -perm -u+x 2>/dev/null | head -1)
+            if [ -n "$LLD_ALT" ]; then ln -sf "$LLD_ALT" "$LLVM/ld.lld"; fi
+          fi
+          test -e "$LLVM/ld.lld"
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "LLVM=$LLVM" >> "$GITHUB_ENV"
           echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
           echo "LLVM_BIN=$LLVM" >> "$GITHUB_ENV"
-          echo "toolchain root: $ROOT"
-          echo "llvm bin:       $LLVM"
-          ls "$ROOT" | head
+          echo "toolchain root: $ROOT"; ls "$ROOT" | head -15
+          echo "llvm bin:       $LLVM"; ls "$LLVM" | grep -E 'clang|ld\.lld' | head -10
+
+      - name: Smoke-test the wrapper (compiler works)
+        working-directory: dropbear
+        run: |
+          set -euo pipefail
+          export CC="$PWD/build-aux/ps4-clang-wrap.sh"
+          "$CC" -c -x c -o /tmp/smoke.o - <<'EOF'
+          int ps4_ci_smoke(void) { return 0; }
+          EOF
+          file /tmp/smoke.o
 
       - name: Configure (PS4 cross)
         working-directory: dropbear
@@ -61,18 +80,16 @@ jobs:
 
       - name: Build dropbear (multi)
         working-directory: dropbear
-        run: |
-          set -euo pipefail
-          make PROGRAMS=dropbear MULTI=1 -j2
+        run: make PROGRAMS=dropbear MULTI=1 -j2
 
       - name: Collect artifacts and hashes
         run: |
           set -euo pipefail
           mkdir -p out
           for f in dropbear/dropbearmulti dropbear/dropbear; do
-            [ -f "$f" ] && cp "$f" "out/$(basename "$f")" && file "out/$(basename "$f")"
+            if [ -f "$f" ]; then cp "$f" "out/$(basename "$f")"; file "out/$(basename "$f")"; fi
           done
-          (cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          (cd out && sha256sum * | tee SHA256SUMS)
           ls -la out
 
       - uses: actions/upload-artifact@v4
