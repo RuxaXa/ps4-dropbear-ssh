@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 pid_t ps4_fork(void) {
@@ -27,6 +28,65 @@ pid_t ps4_fork(void) {
 #else
     return fork();
 #endif
+}
+
+int ps4_execv(const char *path, char *const argv[]) {
+#ifdef __ORBIS__
+    unsigned long ret;
+    unsigned char iserror;
+
+    /* FreeBSD/Orbis SYS_execve. Replaces the calling process image. */
+    __asm__ __volatile__(
+            "syscall"
+            : "=a"(ret), "=@ccc"(iserror)
+            : "a"(59L), "D"(path), "S"(argv), "d"((void *)0)
+            : "rcx", "r11", "memory");
+    if (iserror) {
+        errno = (int)ret;
+    }
+    return -1;
+#else
+    execv(path, argv);
+    return -1;
+#endif
+}
+
+pid_t ps4_waitpid(pid_t pid, int *status) {
+#ifdef __ORBIS__
+    unsigned long ret;
+    unsigned char iserror;
+
+    /* FreeBSD/Orbis SYS_wait4(pid, status, options, rusage). */
+    __asm__ __volatile__(
+            "syscall"
+            : "=a"(ret), "=@ccc"(iserror)
+            : "a"(7L), "D"((long)pid), "S"(status), "d"(0L), "r10"((void *)0)
+            : "rcx", "r11", "memory");
+    if (iserror) {
+        errno = (int)ret;
+        return (pid_t)-1;
+    }
+    return (pid_t)ret;
+#else
+    return waitpid(pid, status, 0);
+#endif
+}
+
+void ps4_exit(int code) {
+#ifdef __ORBIS__
+    unsigned long ret;
+    unsigned char iserror;
+
+    /* FreeBSD/Orbis SYS_exit. Never returns. */
+    __asm__ __volatile__(
+            "syscall"
+            : "=a"(ret), "=@ccc"(iserror)
+            : "a"(1L), "D"((long)code)
+            : "rcx", "r11", "memory");
+    (void)ret;
+    (void)iserror;
+#endif
+    _exit(code);
 }
 
 static void ps4_diag_marker(int fd, const char *marker, size_t marker_len) {
