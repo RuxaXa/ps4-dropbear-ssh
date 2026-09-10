@@ -190,9 +190,22 @@ jobs:
           cp "$OO/src/modules/libc.prx" . ; cp "$OO/src/modules/libSceFios2.prx" .
           ls -l icon0.png
 
-          # 5) build the PKG. pkg_build signs the package, so it needs the
-          #    isolated OpenSSL 1.1 runtime shipped inside the toolchain.
-          export LD_LIBRARY_PATH="$OO/lib/linux:$OO/bin/linux:$OO/lib:$OO:${LD_LIBRARY_PATH:-}"
+          # 5) build the PKG. PkgTool.Core is a .NET app: pkg_build signs and therefore
+          #    probes OpenSSL. Ubuntu 24.04 only has libssl3, so provide an isolated
+          #    OpenSSL 1.1 (the "isolated compatible OpenSSL 1.1 runtime" the release
+          #    notes refer to) by unpacking the focal libssl1.1 package.
+          OPENSSL11=/opt/openssl11
+          mkdir -p "$OPENSSL11"
+          if [ ! -e "$OPENSSL11/libssl.so.1.1" ]; then
+            for idx in "http://security.ubuntu.com/ubuntu/pool/main/o/openssl/" "http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/"; do
+              DEB=$(curl -fsSL "$idx" | grep -oE 'libssl1\.1_[^"]*_amd64\.deb' | sort -u | tail -1 || true)
+              [ -n "$DEB" ] && { echo "libssl1.1 package: $DEB"; curl -fsSL -o /tmp/libssl1.1.deb "$idx$DEB" && break; }
+            done
+            test -s /tmp/libssl1.1.deb || { echo "FEHLER: libssl1.1 nicht ladbar"; exit 1; }
+            dpkg -x /tmp/libssl1.1.deb "$OPENSSL11"
+          fi
+          ls -l "$OPENSSL11/usr/lib/x86_64-linux-gnu/" | head
+          export LD_LIBRARY_PATH="$OPENSSL11/usr/lib/x86_64-linux-gnu:$OO/lib/linux:$OO/bin/linux:$OO/lib:$OO:${LD_LIBRARY_PATH:-}"
           echo "--- toolchain crypto runtime ---"
           find "$OO" -maxdepth 3 -name 'libcrypto*' -o -maxdepth 3 -name 'libssl*' | head -10 || true
           ldd "$PKGTOOL" | head -20 || true
