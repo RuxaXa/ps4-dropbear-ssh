@@ -21,39 +21,25 @@ jobs:
           echo "--- Baum ---"
           find "$HOME/tc" -maxdepth 3 | head -40
 
-      - name: Locate toolchain root and LLVM bin
+      - name: Install LLVM/clang + lld (OpenOrbis docs: LLVM is installed separately)
         run: |
-          set -uxo pipefail
-          echo "--- Kandidaten (Symlinks inklusive) ---"
-          find "$HOME/tc" \( -name 'clang*' -o -name 'ld.lld*' -o -name 'link.x' -o -name 'crt1.o' \) 2>/dev/null | head -40
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld
+          which clang; clang --version | head -2; which ld.lld; ld.lld --version | head -1
 
+      - name: Locate toolchain root (link.x/include/lib from the tarball)
+        run: |
+          set -euxo pipefail
+          echo "--- Kandidaten ---"
+          find "$HOME/tc" \( -name 'link.x' -o -name 'crt1.o' -o -name 'libc.a' \) 2>/dev/null | head -20
           ROOT=$(dirname "$(find "$HOME/tc" -name 'link.x' 2>/dev/null | head -1)")
-          CLANG=$(find "$HOME/tc" -name 'clang' 2>/dev/null | head -1)
-          if [ -z "${CLANG:-}" ]; then
-            CLANG=$(find "$HOME/tc" -name 'clang-*' 2>/dev/null | head -1)
-          fi
           test -n "${ROOT:-}"
-          test -n "${CLANG:-}"
-          LLVM=$(dirname "$CLANG")
-
-          # Rechte wiederherstellen (tar ohne Modus / kopierte Binaerdateien)
-          chmod -R u+x "$ROOT/bin" 2>/dev/null || true
-          chmod u+x "$LLVM"/* 2>/dev/null || true
-          ls -la "$LLVM" | head -25
-
-          # ld.lld unter kanonischem Namen sicherstellen
-          if [ ! -e "$LLVM/ld.lld" ]; then
-            LLD=$(find "$HOME/tc" -name 'ld.lld*' 2>/dev/null | head -1)
-            if [ -n "${LLD:-}" ]; then ln -sf "$LLD" "$LLVM/ld.lld"; fi
-          fi
-          ls -la "$LLVM" | grep -E 'clang|ld\.lld' || true
-
           echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
-          echo "LLVM_BIN=$LLVM" >> "$GITHUB_ENV"
-          echo "CLANG=$LLVM/clang" >> "$GITHUB_ENV"
-          echo "LLD=$LLVM/ld.lld" >> "$GITHUB_ENV"
-          echo "toolchain root: $ROOT"
-          echo "llvm bin:       $LLVM"
+          echo "LLVM_BIN=/usr/bin" >> "$GITHUB_ENV"
+          echo "CLANG=/usr/bin/clang" >> "$GITHUB_ENV"
+          echo "LLD=/usr/bin/ld.lld" >> "$GITHUB_ENV"
+          echo "toolchain root: $ROOT"; ls "$ROOT" | head -15
 
       - name: Smoke-test compiler + linker
         working-directory: dropbear
