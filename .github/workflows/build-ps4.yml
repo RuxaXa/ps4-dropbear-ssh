@@ -222,6 +222,7 @@ jobs:
           PKGNAME="$(ls *.pkg | head -1)"
           echo "PKGNAME=$PKGNAME"
           set +e
+          echo "--- PkgTool command list"; "$PKGTOOL" 2>&1 | head -25; "$PKGTOOL" --help 2>&1 | head -25
           echo "--- pkg_validate"; "$PKGTOOL" pkg_validate "$PKGNAME" 2>&1 | head -20
           echo "--- pkg_extract"
           rm -rf /tmp/pkgx && mkdir -p /tmp/pkgx
@@ -235,6 +236,17 @@ jobs:
 
           mkdir -p ../../out
           cp -v *.pkg ../../out/ || true
+
+      - name: Prepare PkgTool forensics bundle
+        run: |
+          set -euo pipefail
+          mkdir -p out/forensics/openssl11
+          OO="$OO_PS4_TOOLCHAIN"
+          PT="$(find "$OO" -name 'PkgTool.Core' -type f 2>/dev/null | head -1 || true)"
+          echo "PkgTool: $PT"; cp "$PT" out/forensics/ || true
+          cp /opt/openssl11/usr/lib/x86_64-linux-gnu/libssl.so.1.1 out/forensics/openssl11/ 2>/dev/null || true
+          cp /opt/openssl11/usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 out/forensics/openssl11/ 2>/dev/null || true
+          ls -l out/forensics out/forensics/openssl11
 
       - uses: actions/upload-artifact@v4
         with:
