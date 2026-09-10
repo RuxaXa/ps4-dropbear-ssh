@@ -3,13 +3,29 @@ name: build-ps4
 on:
   workflow_dispatch:
   push:
-    branches: [ main, 'feat/**' ]
+    branches:
+      - main
+      - 'feat/**'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install clang + lld
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld || sudo apt-get install -y -qq clang-19 lld-19
+          set +e
+          if [ ! -e /usr/bin/ld.lld ]; then
+            ALT=$(ls /usr/bin/ld.lld-* 2>/dev/null | head -1)
+            if [ -n "$ALT" ]; then sudo ln -sf "$ALT" /usr/bin/ld.lld; fi
+          fi
+          set -e
+          clang --version | head -2
+          ls -la /usr/bin/clang* /usr/bin/ld.lld* 2>/dev/null | head -10
 
       - name: Fetch OpenOrbis PS4 toolchain v0.5.4
         run: |
@@ -18,40 +34,30 @@ jobs:
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
           mkdir -p "$HOME/tc"
           tar -xzf /tmp/tc.tar.gz -C "$HOME/tc"
-          echo "--- Baum ---"
+          echo "--- Baum (maxdepth 3) ---"
           find "$HOME/tc" -maxdepth 3 | head -40
 
-      - name: Install LLVM/clang + lld (OpenOrbis docs: LLVM is installed separately)
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld
-          which clang; clang --version | head -2; which ld.lld; ld.lld --version | head -1
-
-      - name: Locate toolchain root (link.x/include/lib from the tarball)
+      - name: Resolve toolchain root (link.x + include)
         run: |
           set -euxo pipefail
-          echo "--- Kandidaten ---"
-          find "$HOME/tc" \( -name 'link.x' -o -name 'crt1.o' -o -name 'libc.a' \) 2>/dev/null | head -20
-          ROOT=$(dirname "$(find "$HOME/tc" -name 'link.x' 2>/dev/null | head -1)")
+          ROOT=$(dirname "$(find "$HOME/tc" -name link.x 2>/dev/null | head -1)")
           test -n "${ROOT:-}"
+          test -d "$ROOT/include"
           echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
           echo "LLVM_BIN=/usr/bin" >> "$GITHUB_ENV"
-          echo "CLANG=/usr/bin/clang" >> "$GITHUB_ENV"
-          echo "LLD=/usr/bin/ld.lld" >> "$GITHUB_ENV"
-          echo "toolchain root: $ROOT"; ls "$ROOT" | head -15
+          echo "toolchain root: $ROOT"
+          ls "$ROOT" | head -15
 
-      - name: Smoke-test compiler + linker
+      - name: Smoke-test compiler
         working-directory: dropbear
         run: |
           set -euxo pipefail
           export CC="$PWD/build-aux/ps4-clang-wrap.sh"
-          "$CC" -c -x c -o /tmp/smoke.o - <<'EOF'
-          int ps4_ci_smoke(void) { return 0; }
-          EOF
+          printf 'int ps4_ci_smoke(void) { return 0; }\n' > /tmp/smoke.c
+          "$CC" -c -o /tmp/smoke.o /tmp/smoke.c
           file /tmp/smoke.o
 
-      - name: Configure (PS4 cross)
+      - name: Configure
         working-directory: dropbear
         run: |
           set -euo pipefail
@@ -75,26 +81,30 @@ jobs:
             ac_cv_func_vfork=yes \
             CC="$CC" \
             CFLAGS="-I$OO_PS4_TOOLCHAIN/include -I. -O2 -D__ORBIS__ -D_GNU_SOURCE" \
-            LDFLAGS= LIBS= || { echo '--- config.log ---'; tail -60 config.log; exit 1; }
+            LDFLAGS= LIBS= \
+            || { echo "--- config.log ---"; tail -80 config.log; exit 1; }
 
-      - name: Build dropbear (multi)
+      - name: Build
         working-directory: dropbear
         run: make PROGRAMS=dropbear MULTI=1 -j2
 
-      - name: Collect artifacts and hashes
+      - name: Collect artifacts
         run: |
           set -euo pipefail
           mkdir -p out
-          for f in dropbear/dropbearmulti dropbear/dropbear; do
-            if [ -f "$f" ]; then cp "$f" "out/$(basename "$f")"; file "out/$(basename "$f")"; fi
+          for candidate in dropbear/dropbearmulti dropbear/dropbear; do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" "out/$(basename "$candidate")"
+              file "out/$(basename "$candidate")"
+            fi
           done
-          (cd out && sha256sum * | tee SHA256SUMS)
-          ls -la out
+          cd out
+          sha256sum * | tee SHA256SUMS
+          ls -la
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dropbear-ps4-${{ github.sha }}
-          path: |
-            out/**
+          name: dropbear-ps4
+          path: out/**
           if-no-files-found: error
           retention-days: 30
