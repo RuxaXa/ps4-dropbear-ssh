@@ -18,14 +18,18 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld || sudo apt-get install -y -qq clang-19 lld-19
-          set +e
+
+          # ld.lld unter kanonischem Namen sicherstellen (Paketname variiert)
           if [ ! -e /usr/bin/ld.lld ]; then
-            ALT=$(ls /usr/bin/ld.lld-* 2>/dev/null | head -1)
-            if [ -n "$ALT" ]; then sudo ln -sf "$ALT" /usr/bin/ld.lld; fi
+            ALT=$(command ls /usr/bin/ld.lld-* 2>/dev/null | head -n 1 || true)
+            if [ -n "${ALT:-}" ]; then sudo ln -sf "$ALT" /usr/bin/ld.lld; fi
           fi
-          set -e
-          clang --version | head -2
-          ls -la /usr/bin/clang* /usr/bin/ld.lld* 2>/dev/null | head -10
+
+          clang --version | head -n 2 || true
+          echo "--- clang/ld.lld ---"
+          command ls -l /usr/bin/clang /usr/bin/ld.lld 2>/dev/null || true
+          test -x /usr/bin/clang
+          test -e /usr/bin/ld.lld || { echo "FEHLER: ld.lld nicht verfuegbar"; exit 1; }
 
       - name: Fetch OpenOrbis PS4 toolchain v0.5.4
         run: |
